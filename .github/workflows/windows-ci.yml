@@ -1,0 +1,171 @@
+name: Windows prototype CI
+
+# Public bootstrap: product sources are not imported yet. Automatic triggers
+# are retained as comments; restore them with the corresponding source trees.
+on:
+#   push:
+#     branches: [main]
+#     paths:
+#       - "platforms/windows/**"
+#       - "core/crates/**"
+#       - "core/proto/**"
+#       - ".github/workflows/windows-ci.yml"
+#   pull_request:
+#     paths:
+#       - "platforms/windows/**"
+#       - "core/crates/**"
+#       - "core/proto/**"
+#       - ".github/workflows/windows-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Windows prototype format, lint, and tests
+    # Runs on Donkey, the maintainer's dedicated self-hosted Windows test
+    # machine, as a standard interactive user (maintainer, 2026-10-24: no
+    # hosted Windows). Preserve Core CI's source guard.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.user.type == 'User')
+    runs-on: [self-hosted, Windows, pavu-windows-normal]
+    timeout-minutes: 30
+    # Keep execution-policy bypass scoped to this process. Each native-command
+    # step runs one command so its exit code decides the step.
+    defaults:
+      run:
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
+        working-directory: platforms/windows
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The Interactive SID (S-1-5-4) is what the pipe ACL grants.
+      - name: Report host and effective token
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+          Write-Output ('OS: ' + $os.Caption + ' ' + $os.Version)
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+          Write-Output ('EffectiveAdministrator: ' + $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))
+          Write-Output ('Interactive: ' + [bool]($identity.Groups | Where-Object { $_.Value -eq 'S-1-5-4' }))
+
+      - name: Report existing native MSI tools (no SDK installation)
+        run: |
+          Get-Item "$env:SystemRoot\System32\msi.dll", "$env:SystemRoot\System32\makecab.exe", "$env:SystemRoot\System32\expand.exe" | ForEach-Object { Write-Output ($_.Name + ' ' + $_.VersionInfo.FileVersion) }
+          foreach ($directory in @("${env:ProgramFiles(x86)}\Windows Kits\10\bin", "${env:ProgramFiles(x86)}\Windows Kits\10\Licenses")) {
+            if (Test-Path $directory) { Get-ChildItem $directory | Select-Object -ExpandProperty Name }
+          }
+
+      # Use the newest Python 3.11+ registered by the official installer
+      # (PEP 514), for this user or all users. A runner started before that
+      # install keeps its old PATH, where `python` may be the Microsoft Store
+      # placeholder that only exits with an error.
+      - name: Locate Python
+        run: |
+          $found = foreach ($root in 'HKCU:\Software\Python\PythonCore', 'HKLM:\Software\Python\PythonCore') {
+            Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
+              $install = Get-ItemProperty (Join-Path $_.PSPath 'InstallPath') -ErrorAction SilentlyContinue
+              $exe = if ($install.ExecutablePath) { $install.ExecutablePath } elseif ($install.'(default)') { Join-Path $install.'(default)' 'python.exe' }
+              if ($exe -and (Test-Path $exe)) { [pscustomobject]@{ Version = [version]($_.PSChildName -replace '[^0-9.].*$', ''); Path = $exe } }
+            }
+          }
+          $python = $found | Where-Object { $_.Version -ge [version]'3.11' } | Sort-Object Version -Descending | Select-Object -First 1
+          if (-not $python) { throw 'Python 3.11 or later must be installed on Donkey with the official python.org installer' }
+          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path $python.Path)
+          Write-Output ('Python ' + $python.Version)
+
+      - name: Test native MSI database authoring (no installer execution)
+        run: python -m unittest discover -s packaging -v
+
+      - name: Configure stable Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+
+      - name: Report stable Rust toolchain
+        run: rustup run stable rustc --version --verbose
+
+      - name: Check formatting
+        run: cargo +stable fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo +stable clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo +stable test --locked --workspace
+
+      # Fails rather than skips when the token is elevated or lacks the
+      # Interactive SID; see DEVELOPMENT.
+      - name: Run ordinary interactive user acceptance
+        run: cargo +stable test --locked -p pavu-windows-service --lib pipe::tests::ordinary_interactive_user_acceptance -- --ignored --exact --nocapture
+
+      - name: Remove build output
+        if: always()
+        run: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue target
+
+  dependency-policy:
+    name: Dependency security and licenses
+    # Same check and runner rule as Core CI's dependency policy: a lightweight
+    # job on the self-hosted Linux host (pavu-light). Bot-authored pull
+    # requests from this repository run it on a GitHub-hosted runner instead.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: >-
+      ${{ (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository &&
+            github.event.pull_request.user.type == 'User'))
+          && fromJSON('["self-hosted","Linux","pavu-light"]')
+          || fromJSON('["ubuntu-24.04"]') }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Download a pinned release and verify its checksum instead of adding a
+      # third-party action to the repository's allowed-actions list. cargo-deny
+      # runs `cargo metadata`, so the runner provides a Rust toolchain.
+      - name: Install cargo-deny
+        env:
+          CARGO_DENY_VERSION: 0.20.2
+          CARGO_DENY_SHA256_X64: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+          CARGO_DENY_SHA256_ARM64: 995c82be0defc7a025cae49a2aa2644ce8245c9a3318fc4103907c6a285e8c7d
+        run: |
+          case "${RUNNER_ARCH}" in
+            X64) target=x86_64-unknown-linux-musl; sha256="${CARGO_DENY_SHA256_X64}" ;;
+            ARM64) target=aarch64-unknown-linux-musl; sha256="${CARGO_DENY_SHA256_ARM64}" ;;
+            *) echo "Unsupported runner architecture: ${RUNNER_ARCH}" >&2; exit 1 ;;
+          esac
+          name="cargo-deny-${CARGO_DENY_VERSION}-${target}"
+          archive="${RUNNER_TEMP}/cargo-deny.tar.gz"
+          bin="${RUNNER_TEMP}/bin"
+          mkdir -p "${bin}"
+          curl -sSfL -o "${archive}" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${name}.tar.gz"
+          echo "${sha256}  ${archive}" | sha256sum --check --strict
+          tar -xzf "${archive}" -C "${bin}" --strip-components 1 "${name}/cargo-deny"
+          echo "${bin}" >> "${GITHUB_PATH}"
+
+      - name: Check advisories, licenses, bans, and sources
+        run: |
+          cargo deny --version
+          cargo deny --manifest-path platforms/windows/Cargo.toml --locked --all-features check
+
+      - name: Remove downloaded tools
+        if: always()
+        run: rm -rf "${RUNNER_TEMP}/bin" "${RUNNER_TEMP}/cargo-deny.tar.gz"

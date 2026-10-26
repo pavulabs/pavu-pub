@@ -1,0 +1,200 @@
+name: Windows UI prototype CI
+
+# Called by windows-donkey-admin.yml as its first job, so the UI smoke tests
+# run inside that serialized run, before PavuService is installed. Two
+# workflows sharing one concurrency group would cancel each other's pending
+# runs instead.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  ui:
+    name: Windows UI tests and self-contained build
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.user.type == 'User')
+    # Donkey, as a standard user in its logged-on desktop session, so the UI
+    # smoke tests can open windows (maintainer, 2026-10-24: no hosted Windows).
+    runs-on: [self-hosted, Windows, pavu-windows-normal]
+    timeout-minutes: 30
+    defaults:
+      run:
+        # Windows PowerShell, as built into Donkey; scope the policy bypass to
+        # this process.
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
+        working-directory: platforms/windows/ui
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_GENERATE_ASPNET_CERTIFICATE: 'false'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The standard user cannot write to Program Files; keep the SDK in the
+      # runner's tool cache, which persists between jobs.
+      - uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        env:
+          DOTNET_INSTALL_DIR: ${{ runner.tool_cache }}/dotnet
+        with:
+          dotnet-version: '8.0.426'
+      - name: Report SDK and host
+        run: |
+          Write-Output ('OS: ' + (Get-CimInstance Win32_OperatingSystem).Version)
+          dotnet --info
+      - name: Restore tests from locks and audit packages
+        run: dotnet restore Pavu.Windows.Tests --locked-mode
+      - name: Test protocol and client
+        run: dotnet test Pavu.Windows.Tests --no-restore -c Release
+      # Use the newest Python 3.11+ registered by the official installer
+      # (PEP 514), for this user or all users. A runner started before that
+      # install keeps its old PATH, where `python` may be the Microsoft Store
+      # placeholder that only exits with an error.
+      - name: Locate Python
+        run: |
+          $found = foreach ($root in 'HKCU:\Software\Python\PythonCore', 'HKLM:\Software\Python\PythonCore') {
+            Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
+              $install = Get-ItemProperty (Join-Path $_.PSPath 'InstallPath') -ErrorAction SilentlyContinue
+              $exe = if ($install.ExecutablePath) { $install.ExecutablePath } elseif ($install.'(default)') { Join-Path $install.'(default)' 'python.exe' }
+              if ($exe -and (Test-Path $exe)) { [pscustomobject]@{ Version = [version]($_.PSChildName -replace '[^0-9.].*$', ''); Path = $exe } }
+            }
+          }
+          $python = $found | Where-Object { $_.Version -ge [version]'3.11' } | Sort-Object Version -Descending | Select-Object -First 1
+          if (-not $python) { throw 'Python 3.11 or later must be installed on Donkey with the official python.org installer' }
+          Add-Content -Path $env:GITHUB_ENV -Encoding utf8 -Value ('PAVU_PYTHON=' + [IO.Path]::GetFullPath($python.Path))
+          Write-Output ('Python ' + $python.Version)
+      - name: Verify Python before publishing
+        run: |
+          $verificationStage = 'registered-resolution'
+          try {
+            if (-not $env:PAVU_PYTHON -or -not (Test-Path -LiteralPath $env:PAVU_PYTHON -PathType Leaf)) {
+              throw 'Registered Python executable is unavailable'
+            }
+            $verificationStage = 'registered-execution'
+            & $env:PAVU_PYTHON -c "import os, sys; assert sys.version_info >= (3, 11), sys.version; assert os.path.samefile(sys.executable, sys.argv[1]); print(sys.version)" $env:PAVU_PYTHON
+            if ($LASTEXITCODE -ne 0) { throw 'Registered Python executable failed validation' }
+            # Reproduce a stale PATH with an unusable python alias, without
+            # changing the host PATH or Windows App Execution Alias settings.
+            $verificationStage = 'alias-fixture-creation'
+            $aliasDirectory = Join-Path $env:RUNNER_TEMP ('pavu-python-alias-' + [guid]::NewGuid())
+            $originalPath = $env:PATH
+            try {
+              New-Item -ItemType Directory -Path $aliasDirectory | Out-Null
+              Set-Content -Path (Join-Path $aliasDirectory 'python.cmd') -Encoding ascii -Value '@exit /b 91'
+              $otherDirectory = Join-Path $aliasDirectory 'second'
+              New-Item -ItemType Directory -Path $otherDirectory | Out-Null
+              Set-Content -Path (Join-Path $otherDirectory 'python.cmd') -Encoding ascii -Value '@exit /b 92'
+              $env:PATH = $aliasDirectory + ';' + $otherDirectory
+              $verificationStage = 'unusable-alias-execution'
+              python -c "import sys"
+              if ($LASTEXITCODE -ne 91) { throw 'Synthetic stale PATH did not reproduce the unusable alias' }
+              $verificationStage = 'reordered-alias-execution'
+              $env:PATH = $otherDirectory + ';' + $aliasDirectory
+              python -c "import sys"
+              if ($LASTEXITCODE -ne 92) { throw 'Synthetic PATH reordering did not select the other alias' }
+              $verificationStage = 'registered-execution-with-stale-path'
+              & $env:PAVU_PYTHON -c "import os, sys; assert sys.version_info >= (3, 11), sys.version; assert os.path.samefile(sys.executable, sys.argv[1])" $env:PAVU_PYTHON
+              if ($LASTEXITCODE -ne 0) { throw 'Registered Python failed with stale PATH' }
+              $verificationStage = 'normalized-executable-path'
+              $equivalentPath = Join-Path (Split-Path $env:PAVU_PYTHON) ('.\' + (Split-Path $env:PAVU_PYTHON -Leaf))
+              & $equivalentPath -c "import os, sys; assert os.path.samefile(sys.executable, sys.argv[1])" $env:PAVU_PYTHON
+              if ($LASTEXITCODE -ne 0) { throw 'Equivalent Python path selected a different executable' }
+            } finally {
+              $env:PATH = $originalPath
+              Remove-Item -LiteralPath $aliasDirectory -Recurse -Force
+            }
+          } catch {
+            # Stable phase/type/exit code only: no PATH, registry or host-data dump.
+            Write-Output ('::error title=Python verification::Stage=' + $verificationStage + '; exception=' + $_.Exception.GetType().Name + '; nativeExit=' + $LASTEXITCODE)
+            throw
+          }
+      - name: Test smoke failure diagnostics without launching an application
+        run: ./test-smoke-diagnostics.ps1
+      - name: Publish self-contained UI and check runtime inventory
+        id: publish
+        run: ./build.ps1 -PythonExecutable $env:PAVU_PYTHON
+      - name: Archive unsigned prototype
+        run: Compress-Archive -Path artifacts/Pavu-Windows-x64 -DestinationPath artifacts/Pavu-Windows-x64-unsigned.zip
+      - name: Extract archive and verify every payload file
+        run: |
+          $destination = Join-Path $env:RUNNER_TEMP 'Pavu extracted archive'
+          if (Test-Path $destination) { throw 'Archive test destination must be new' }
+          Expand-Archive -Path artifacts/Pavu-Windows-x64-unsigned.zip -DestinationPath $destination
+          function Get-Inventory([string]$Directory) {
+            $root = (Resolve-Path $Directory).Path
+            Get-ChildItem -LiteralPath $root -Recurse -File -Force | ForEach-Object {
+              $relative = $_.FullName.Substring($root.Length)
+              $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+              "$relative=$hash"
+            } | Sort-Object
+          }
+          $source = @(Get-Inventory 'artifacts/Pavu-Windows-x64')
+          $extracted = @(Get-Inventory (Join-Path $destination 'Pavu-Windows-x64'))
+          if ($source.Count -eq 0 -or $extracted.Count -eq 0) { throw 'Archive payload is empty' }
+          if (Compare-Object $source $extracted -CaseSensitive) { throw 'Archive payload differs from published output' }
+          Write-Output ('Verified archived payload files: ' + $extracted.Count)
+      - name: Launch and close the archived UI
+        run: ./smoke.ps1 -Directory (Join-Path $env:RUNNER_TEMP 'Pavu extracted archive/Pavu-Windows-x64')
+      - name: Exercise archived disconnected UI interactions
+        run: |
+          $directory = Join-Path $env:RUNNER_TEMP 'Pavu extracted archive/Pavu-Windows-x64'
+          powershell.exe -NoProfile -NonInteractive -File ./interaction-smoke.ps1 -Directory $directory
+          if ($LASTEXITCODE -ne 0) { throw 'UI interaction checks failed' }
+      - name: Configure Rust for native release payload
+        run: rustup toolchain install stable --profile minimal
+      - name: Build release service and CLI without running them
+        working-directory: platforms/windows
+        run: cargo +stable build --locked --release --workspace --bins
+      - name: Stage real release payload for install-blocked MSI
+        working-directory: platforms/windows
+        run: |
+          # Donkey has no Git; checkout uses the REST API and fetches exactly GITHUB_SHA.
+          $revision = $env:GITHUB_SHA
+          if ($revision -notmatch '^[0-9a-f]{40}$') { throw 'Cannot determine checked-out revision' }
+          $version = & $env:PAVU_PYTHON -c "import tomllib; print(tomllib.load(open('Cargo.toml', 'rb'))['workspace']['package']['version'])"
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot determine native package version' }
+          & $env:PAVU_PYTHON packaging/prepare.py --ui ui/artifacts/Pavu-Windows-x64 --service target/release/pavu-windows-service.exe --cli target/release/pavu-windows-cli.exe --output ui/artifacts/msi-stage --version $version --revision $revision
+          if ($LASTEXITCODE -ne 0) { throw 'Real payload staging failed' }
+      - name: Record locked native Cargo dependency metadata
+        working-directory: platforms/windows
+        run: |
+          # Windows PowerShell's default redirection is UTF-16; the audit reads UTF-8 JSON.
+          cargo +stable metadata --locked --offline --format-version 1 --filter-platform x86_64-pc-windows-msvc | Out-File -Encoding utf8 -FilePath ui/artifacts/native-cargo-metadata.json
+          if ($LASTEXITCODE -ne 0) { throw 'Native Cargo metadata failed' }
+      - name: Audit native PE imports and collect license evidence without execution
+        working-directory: platforms/windows
+        run: |
+          & $env:PAVU_PYTHON packaging/native_dependencies.py --stage ui/artifacts/msi-stage --metadata ui/artifacts/native-cargo-metadata.json --output ui/artifacts/native-evidence
+          if ($LASTEXITCODE -ne 0) { throw 'Native dependency audit failed' }
+      - name: Build and read back real-payload MSI without installation
+        id: msi
+        working-directory: platforms/windows
+        run: |
+          & $env:PAVU_PYTHON packaging/native_msi.py --stage ui/artifacts/msi-stage --output ui/artifacts/Pavu-Windows-x64-NONINSTALLABLE.msi
+      - name: Upload install-blocked MSI review artifact
+        if: ${{ !cancelled() && steps.msi.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pavu-windows-msi-NONINSTALLABLE
+          path: |
+            platforms/windows/ui/artifacts/Pavu-Windows-x64-NONINSTALLABLE.msi
+            platforms/windows/ui/artifacts/msi-stage/manifest.json
+            platforms/windows/ui/artifacts/msi-stage/tables.json
+            platforms/windows/ui/artifacts/native-evidence/
+          retention-days: 7
+          if-no-files-found: error
+      - name: Upload unsigned review artifact
+        if: ${{ !cancelled() && steps.publish.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pavu-windows-ui-unsigned
+          path: platforms/windows/ui/artifacts/Pavu-Windows-x64-unsigned.zip
+          retention-days: 7
+          if-no-files-found: error
+      - name: Remove build output
+        if: always()
+        working-directory: platforms/windows
+        run: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue target, ui/artifacts

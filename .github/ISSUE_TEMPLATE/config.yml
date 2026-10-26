@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞私密报告
+    url: https://github.com/pavulabs/pavu-pub/security/advisories/new
+    about: 请勿公开披露漏洞、敏感日志或可利用细节。
+  - name: 项目网站与文档
+    url: https://pavu.org
+    about: 源码和开发文档尚未全部迁入，请先查看项目网站与 README。

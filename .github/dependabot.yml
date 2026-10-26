@@ -1,0 +1,19 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    # Wait for new releases to age before proposing them (supply-chain hardening).
+    # Security updates are not delayed by cooldown.
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      github-actions:
+        update-types: [minor, patch]
+
+# Add the Core and platform Cargo ecosystems when their manifests are imported.

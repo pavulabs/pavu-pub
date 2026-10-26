@@ -1,0 +1,229 @@
+name: macOS release
+# scripts/release-macos.sh matches "macOS release next preview" to find merge
+# builds; keep the two in sync.
+run-name: macOS release ${{ inputs.version && format('v{0}', inputs.version) || (github.ref_type == 'tag' && github.ref_name) || 'next preview' }}
+
+# Builds the signed and notarized installer on the maintainer's self-hosted Mac
+# and attaches it to a GitHub Release. Every merge to main that changes the app
+# publishes the next preview as a pre-release (0.1.1-preview ->
+# 0.1.2-preview). A manual run (scripts/release-macos.sh) builds a chosen version
+# and leaves a draft unless the publish input is set; a pushed version tag
+# always leaves a draft. Never runs for pull requests.
+# Signing uses the Developer ID certificate in that Mac's login keychain and
+# notarization reads the app-specific password APPLE_APP_KEY from the runner
+# account's ~/.zshenv, so no signing material is kept in GitHub secrets. See
+# docs/DEVELOPMENT.md.
+# Public bootstrap: product sources are not imported yet. Automatic triggers
+# are retained as comments; restore them with the corresponding source trees.
+on:
+#   push:
+#     tags: ["v*"]
+#     branches: [main]
+#     # Only changes that end up in the installer; merges that touch only docs,
+#     # designs, or other CI do not cut a release.
+#     paths:
+#       - "core/**"
+#       - "Pavu/**"
+#       - "PavuNetworkExtension/**"
+#       - "Shared/**"
+#       - "Pavu.xcodeproj/**"
+#       - "platforms/macos/**"
+#       - "scripts/build-macos-release.sh"
+#       - "scripts/fetch-geoip.sh"
+#       - "scripts/next-macos-version.sh"
+#       - ".github/workflows/macos-release.yml"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version without the leading v, for example 0.1.2-preview"
+        required: true
+        type: string
+      publish:
+        description: "Publish the release instead of leaving a draft"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Previews for merges queue in their own group: while one builds,
+# a newer merge replaces any merge still waiting, so its build covers both.
+# Manual runs and tags are never replaced by a merge; scripts/release-macos.sh
+# waits for a running merge build so two signed builds do not overlap.
+concurrency:
+  group: macos-release-${{ github.event_name == 'push' && github.ref_type == 'branch' && 'merge' || github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  installer:
+    name: Signed and notarized installer
+    if: >-
+      github.repository == 'pavulabs/pavu-pub' &&
+      (startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main')
+    # Only runners whose service can read the Xcode account in the login
+    # keychain carry pavu-release (fiona-1 and fiona-2); a runner started
+    # outside the logged-in session fails at code signing.
+    runs-on: [self-hosted, macOS, pavu-macos, pavu-release]
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if [[ "${REF_TYPE}" == "tag" ]]; then
+            version="${REF_NAME#v}"
+          elif [[ "${EVENT_NAME}" == "push" ]]; then
+            version=$(bash scripts/next-macos-version.sh)
+          else
+            version="${INPUT_VERSION#v}"
+          fi
+          echo "Version: ${version}"
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]; then
+            echo "::error::Version must look like 1.2.3 or 1.2.3-preview, got '${version}'."
+            exit 1
+          fi
+          prerelease=false
+          if [[ "${version}" == *-* ]]; then
+            prerelease=true
+          fi
+          {
+            printf 'version=%s\n' "${version}"
+            printf 'tag=v%s\n' "${version}"
+            printf 'prerelease=%s\n' "${prerelease}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Refuse to replace an existing release or tag
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            # Publishing a draft made by a manual run creates its tag, which
+            # triggers this workflow again; that release is already built.
+            target=$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json targetCommitish -q .targetCommitish)
+            if [[ "${REF_TYPE}" == "tag" && "${target}" == "${GITHUB_SHA}" ]]; then
+              echo "::notice::A release for ${TAG} built from ${GITHUB_SHA} already exists; nothing to build."
+              echo "skip=true" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            echo "::error::A release for ${TAG} already exists. Delete the draft or pick a new version."
+            exit 1
+          fi
+          # A manual or merge run builds the current main commit, so an existing
+          # tag would point the release at a different commit than the one built.
+          if [[ "${REF_TYPE}" != "tag" ]] &&
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists. Push the tag to build it, or pick a new version."
+            exit 1
+          fi
+
+      - name: Report toolchain versions
+        if: steps.existing.outputs.skip != 'true'
+        run: |
+          xcodebuild -version
+          rustc --version
+          cargo --version
+
+      # The password is masked, exported only to the script, and never written
+      # to GITHUB_ENV or the log.
+      - name: Build, sign, and notarize
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          APPLE_ID: ${{ vars.APPLE_ID }}
+          PAVU_BUILD_NUMBER: ${{ github.run_number }}
+          PAVU_WORK_DIR: ${{ runner.temp }}/pavu-release
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          APPLE_APP_KEY=$(zsh -c 'source "${HOME}/.zshenv" >/dev/null 2>&1; printf %s "${APPLE_APP_KEY:-}"')
+          if [[ -z "${APPLE_APP_KEY}" ]]; then
+            echo "::error::APPLE_APP_KEY is not set in the runner account's ~/.zshenv."
+            exit 1
+          fi
+          echo "::add-mask::${APPLE_APP_KEY}"
+          export APPLE_APP_KEY
+          bash scripts/build-macos-release.sh "${VERSION}" "${RUNNER_TEMP}/pavu-release-out"
+
+      - name: Keep a copy on the runner
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          dest="${HOME}/pavu-builds/$(date -u +%Y-%m-%d)-${TAG}-run${GITHUB_RUN_ID}"
+          mkdir -p "${dest}"
+          cp "${RUNNER_TEMP}"/pavu-release-out/* "${dest}/"
+          echo "Copied the installer to ${dest}"
+          # Every merge builds, so keep only the newest 20 copies made by this
+          # workflow (any trigger); builds made by running the build script by
+          # hand, such as ~/pavu-builds/manual, are left alone.
+          # The glob always matches at least the copy made above.
+          ls -1dt "${HOME}"/pavu-builds/*-v*-run*/ | tail -n +21 | while IFS= read -r old; do
+            echo "Removing old copy ${old}"
+            rm -rf "${old}"
+          done
+
+      - name: Create release
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Merge builds publish their preview; manual runs follow the input.
+          PUBLISH: ${{ (inputs.publish || (github.event_name == 'push' && github.ref_type == 'branch')) && 'true' || 'false' }}
+          PRERELEASE: ${{ steps.version.outputs.prerelease }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          notes="${RUNNER_TEMP}/release-notes.md"
+          {
+            printf 'Signed and notarized macOS installer for Apple silicon (arm64), built from %s (%s).\n\n' \
+              "${GITHUB_SHA}" "$(git log -1 --format=%s "${GITHUB_SHA}")"
+            printf 'SHA-256:\n\n```\n'
+            cat "${RUNNER_TEMP}/pavu-release-out/Pavu-${VERSION}-arm64.dmg.sha256"
+            printf '```\n\nOpen the DMG and drag Pavu to Applications. The system extension can only be activated from /Applications.\n'
+          } > "${notes}"
+          args=(--repo "${GITHUB_REPOSITORY}" --target "${GITHUB_SHA}"
+                --title "Pavu ${VERSION}" --notes-file "${notes}")
+          # Tag pushes always leave a draft; manual runs with publish and merge
+          # runs publish.
+          if [[ "${PUBLISH}" != "true" ]]; then
+            args+=(--draft)
+          fi
+          if [[ "${PRERELEASE}" == "true" ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create "${TAG}" "${args[@]}" \
+            "${RUNNER_TEMP}/pavu-release-out/Pavu-${VERSION}-arm64.dmg" \
+            "${RUNNER_TEMP}/pavu-release-out/Pavu-${VERSION}-arm64.dmg.sha256"
+
+      # The runner is persistent and short on disk: remove build output even
+      # when an earlier step fails. The copy under ~/pavu-builds stays.
+      # The archive, export and DMG checks each register a copy of org.pavu;
+      # drop those records before the bundles go (#97).
+      - name: Unregister build copies from LaunchServices
+        if: always()
+        # Skipped when an earlier failure left no checkout, so it adds no
+        # second error.
+        run: |
+          [[ -f scripts/unregister-runner-builds.sh ]] || exit 0
+          bash scripts/unregister-runner-builds.sh
+
+      - name: Remove build output
+        if: always()
+        run: rm -rf "${RUNNER_TEMP}/pavu-release" "${RUNNER_TEMP}/pavu-release-out" "${RUNNER_TEMP}/release-notes.md" core/target

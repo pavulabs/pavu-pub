@@ -1,0 +1,281 @@
+name: Core CI
+
+# Public bootstrap: product sources are not imported yet. Automatic triggers
+# are retained as comments; restore them with the corresponding source trees.
+on:
+#   push:
+#     branches: [main]
+#     paths:
+#       - "core/**"
+#       - "scripts/*ai*catalog*.py"
+#       - "scripts/verify-public-catalog.py"
+#       - "scripts/verify-ai-assets.py"
+#       - "scripts/tests/test_ai_catalog_signatures.py"
+#       - "scripts/evaluate-ai.py"
+#       - "scripts/tests/test_ai_evaluation.py"
+#       - ".github/workflows/core-ci.yml"
+#   pull_request:
+#     paths:
+#       - "core/**"
+#       - "scripts/*ai*catalog*.py"
+#       - "scripts/verify-public-catalog.py"
+#       - "scripts/verify-ai-assets.py"
+#       - "scripts/tests/test_ai_catalog_signatures.py"
+#       - "scripts/evaluate-ai.py"
+#       - "scripts/tests/test_ai_evaluation.py"
+#       - ".github/workflows/core-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: core-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  quality:
+    name: Format, lint, test, and minimum Rust
+    # Runs on the maintainer's self-hosted Mac; Core has no platform-gated code.
+    # Only pull requests opened by a person from a branch of this repository
+    # run on it. There is no GitHub-hosted fallback (maintainer decision: no
+    # hosted macOS minutes), so bot-authored and fork pull requests skip it.
+    # Before merging, a maintainer runs this workflow with workflow_dispatch on
+    # the bot's branch, or, for a fork, on a repository branch holding the
+    # reviewed head. The job uses the Mac's installed stable toolchain without
+    # changing defaults.
+    # A separate Linux job runs Core directly on pavu-linux as well.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.user.type == 'User')
+    runs-on: [self-hosted, macOS, pavu-macos]
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Report stable Rust toolchain
+        run: |
+          cargo +stable --version
+          cargo +stable fmt --version
+          cargo +stable clippy --version
+
+      - name: Check formatting
+        working-directory: core
+        run: cargo +stable fmt --all -- --check
+
+      - name: Verify packaged public data and signing requirements
+        run: |
+          python3 -m unittest discover -s scripts/tests -p test_ai_catalog_signatures.py
+          python3 scripts/verify-public-catalog.py
+          python3 scripts/verify-ai-assets.py
+
+      - name: Run Clippy
+        working-directory: core
+        run: cargo +stable clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests
+        working-directory: core
+        run: cargo +stable test --locked --workspace
+
+      - name: Check offline redaction evaluation golden
+        run: |
+          python3 -m unittest discover -s scripts/tests -p test_ai_evaluation.py -v
+          pavu_eval_dir="$(mktemp -d)"
+          trap 'rm -rf "${pavu_eval_dir}"' EXIT
+          cargo +stable run --locked --offline --manifest-path core/Cargo.toml \
+            -p pavu-ai --example prepare_evaluation > "${pavu_eval_dir}/inputs.json"
+          python3 scripts/evaluate-ai.py "${pavu_eval_dir}/inputs.json" \
+            --reference --check-golden core/crates/pavu-ai/evaluation/golden.json
+
+      # Heap budget for Core under a live workload (#125); too slow in debug.
+      - name: Check Core memory budget
+        working-directory: core
+        run: cargo +stable test --locked --release -p pavu-core --test memory_budget -- --ignored --nocapture
+
+      # In the same job rather than a parallel one, so a Core change holds one
+      # of the Mac's two runners instead of both. Installing the pinned
+      # toolchain adds it alongside, without changing the default.
+      - name: Configure minimum supported Rust 1.89
+        run: rustup toolchain install 1.89.0 --profile minimal
+
+      - name: Check workspace with minimum Rust
+        working-directory: core
+        run: cargo +1.89.0 check --locked --workspace --all-targets
+
+      - name: Remove build output
+        if: always()
+        run: rm -rf core/target
+
+  linux:
+    name: Linux format, lint, and tests
+    # charming-1/charming-2 share one user and Rust home with Linux prototype CI.
+    # Keep its pinned, skip-if-installed setup and host-wide installation lock.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.user.type == 'User')
+    runs-on: [self-hosted, Linux, pavu-linux]
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      LINUX_RUST_STABLE: "1.99.1"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check system Rust tools
+        run: |
+          command -v rustup cargo rustc flock
+          rustup --version
+
+      - name: Configure Rust
+        run: |
+          toolchain="${LINUX_RUST_STABLE}"
+          toolchain_ready() {
+            local installed component
+            rustup toolchain list | awk -v version="${toolchain}" '
+              $1 == version || index($1, version "-") == 1 { found = 1 }
+              END { exit !found }' || return 1
+            installed="$(rustup component list --installed --toolchain "${toolchain}")" || return 1
+            for component in cargo rustc rust-std rustfmt clippy; do
+              awk -v component="${component}" '
+                $1 == component || index($1, component "-") == 1 { found = 1 }
+                END { exit !found }' <<< "${installed}" || return 1
+            done
+          }
+          if ! toolchain_ready; then
+            # Both runners share Rust state; recheck after taking the host-wide lock.
+            mkdir -p "${RUSTUP_HOME:-$HOME/.rustup}"
+            exec 9>"${RUSTUP_HOME:-$HOME/.rustup}/.pavu-ci.lock"
+            flock 9
+            if ! toolchain_ready; then
+              rustup toolchain install "${toolchain}" --profile minimal --component cargo,rustc,rust-std,rustfmt,clippy --no-self-update
+            fi
+          fi
+          cargo +"${toolchain}" --version
+          rustc +"${toolchain}" --version
+
+      - name: Check formatting
+        working-directory: core
+        run: cargo +"${LINUX_RUST_STABLE}" fmt --all -- --check
+
+      - name: Run Clippy
+        working-directory: core
+        run: cargo +"${LINUX_RUST_STABLE}" clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests
+        working-directory: core
+        run: cargo +"${LINUX_RUST_STABLE}" test --locked --workspace
+
+      - name: Remove build output
+        if: always()
+        run: rm -rf core/target
+
+  windows:
+    name: Windows lint and test
+    # Runs on Donkey, the maintainer's self-hosted Windows test machine, as a
+    # standard user (maintainer, 2026-10-24: no hosted Windows). Keep the
+    # existing source guard; reviewed bot/fork heads still require a manual
+    # dispatch.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.user.type == 'User')
+    runs-on: [self-hosted, Windows, pavu-windows-normal]
+    timeout-minutes: 30
+    # Keep execution-policy bypass scoped to this process. Each native-command
+    # step runs one command so its exit code decides the step.
+    defaults:
+      run:
+        shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configure stable Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+
+      - name: Report stable Rust toolchain
+        run: rustup run stable rustc --version --verbose
+
+      - name: Run Clippy
+        working-directory: core
+        run: cargo +stable clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests
+        working-directory: core
+        run: cargo +stable test --locked --workspace
+
+      - name: Remove build output
+        if: always()
+        run: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue core\target
+
+  dependency-policy:
+    name: Dependency security and licenses
+    # A lightweight check, so it runs on the maintainer's self-hosted Linux
+    # host (pavu-light), not the build Mac. Bot-authored pull requests from
+    # this repository run on a GitHub-hosted runner instead.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: >-
+      ${{ (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository &&
+            github.event.pull_request.user.type == 'User'))
+          && fromJSON('["self-hosted","Linux","pavu-light"]')
+          || fromJSON('["ubuntu-24.04"]') }}
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Download a pinned release and verify its checksum instead of adding a
+      # third-party action to the repository's allowed-actions list. cargo-deny
+      # runs `cargo metadata`, so the runner provides a Rust toolchain.
+      - name: Install cargo-deny
+        env:
+          CARGO_DENY_VERSION: 0.20.2
+          CARGO_DENY_SHA256_X64: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+          CARGO_DENY_SHA256_ARM64: 995c82be0defc7a025cae49a2aa2644ce8245c9a3318fc4103907c6a285e8c7d
+        run: |
+          case "${RUNNER_ARCH}" in
+            X64) target=x86_64-unknown-linux-musl; sha256="${CARGO_DENY_SHA256_X64}" ;;
+            ARM64) target=aarch64-unknown-linux-musl; sha256="${CARGO_DENY_SHA256_ARM64}" ;;
+            *) echo "Unsupported runner architecture: ${RUNNER_ARCH}" >&2; exit 1 ;;
+          esac
+          name="cargo-deny-${CARGO_DENY_VERSION}-${target}"
+          archive="${RUNNER_TEMP}/cargo-deny.tar.gz"
+          bin="${RUNNER_TEMP}/bin"
+          mkdir -p "${bin}"
+          curl -sSfL -o "${archive}" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${name}.tar.gz"
+          echo "${sha256}  ${archive}" | sha256sum --check --strict
+          tar -xzf "${archive}" -C "${bin}" --strip-components 1 "${name}/cargo-deny"
+          echo "${bin}" >> "${GITHUB_PATH}"
+
+      - name: Check advisories, licenses, bans, and sources
+        run: |
+          cargo deny --version
+          cargo deny --manifest-path core/Cargo.toml --locked --all-features check
+
+      - name: Remove downloaded tools
+        if: always()
+        run: rm -rf "${RUNNER_TEMP}/bin" "${RUNNER_TEMP}/cargo-deny.tar.gz"

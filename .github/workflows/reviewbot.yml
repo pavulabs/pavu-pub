@@ -1,0 +1,289 @@
+name: ReviewBot
+
+on:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] reviewed: no PR code runs, fork PRs skipped; see docs/REVIEWBOT.md
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reviewbot-${{ github.event.pull_request.number || github.ref }}-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  diff-regression:
+    name: Verify ReviewBot merge-base diff
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, pavu-review]
+    timeout-minutes: 5
+    steps:
+      - name: Check out fixture validation revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify actual prompt construction with synthetic history
+        run: python3 scripts/tests/test_reviewbot_diff.py -v
+
+      - name: Verify response diagnostics and bounded retry with stubbed HTTP
+        run: python3 scripts/tests/test_reviewbot_response.py -v
+
+  review:
+    name: Analyze pull request
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.draft == false
+    # Pull requests that a person opens from a branch of this repository run on
+    # the maintainer's self-hosted review runners (label pavu-review) to save hosted minutes; fork and bot pull
+    # requests stay on a GitHub-hosted runner. See docs/REVIEWBOT.md.
+    runs-on: >-
+      ${{ (github.event.pull_request.head.repo.full_name == github.repository &&
+           github.event.pull_request.user.type == 'User') &&
+          fromJSON('["self-hosted","pavu-review"]') || 'ubuntu-24.04' }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      final_message: ${{ steps.review.outputs.final_message }}
+      model_id_b64: ${{ steps.review.outputs.model_id_b64 }}
+    steps:
+      - name: Check ReviewBot configuration
+        id: configuration
+        env:
+          REVIEWBOT_API_KEY: ${{ secrets.ARK_API_KEY }}
+        run: |
+          if [[ -n "${REVIEWBOT_API_KEY}" ]]; then
+            echo "enabled=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "enabled=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Report disabled ReviewBot
+        if: steps.configuration.outputs.enabled != 'true'
+        run: echo "::notice::ReviewBot is disabled until the ARK_API_KEY repository secret is configured."
+
+      - name: Check for an existing review of this commit
+        id: existing_review
+        if: steps.configuration.outputs.enabled == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          REVIEWED_COMMIT: ${{ github.event.pull_request.head.sha }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const commit = process.env.REVIEWED_COMMIT;
+            const marker = `<!-- pavu-reviewbot:${commit} -->`;
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              per_page: 100,
+            });
+            const exists = reviews.some(
+              (review) =>
+                review.user?.login === "github-actions[bot]" &&
+                review.body?.includes(marker),
+            );
+
+            core.setOutput("should_review", exists ? "false" : "true");
+            if (exists) {
+              core.notice(`ReviewBot already reviewed ${commit}; skipping Ark analysis.`);
+            }
+
+      - name: Check out pull request head for static diff
+        if: steps.configuration.outputs.enabled == 'true' && steps.existing_review.outputs.should_review == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # A pull request can commit `* -diff` (or a path-specific rule) and make
+      # `git diff` report "Binary files differ" instead of its changes. Drop
+      # the worktree attribute files so git's built-in detection applies.
+      - name: Ignore pull request diff attributes
+        if: steps.configuration.outputs.enabled == 'true' && steps.existing_review.outputs.should_review == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' path; do
+            rm -f -- "${path}"
+          done < <(git ls-files -z -- '*.gitattributes')
+
+      - name: Run ReviewBot with Ark
+        id: review
+        if: steps.configuration.outputs.enabled == 'true' && steps.existing_review.outputs.should_review == 'true'
+        shell: bash
+        env:
+          ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
+          ARK_MODEL: ${{ vars.ARK_REVIEW_MODEL || 'kimi-k3' }}
+          TRUSTED_SHA: ${{ github.workflow_sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          review_input="${RUNNER_TEMP}/reviewbot-input.txt"
+          request_body="${RUNNER_TEMP}/reviewbot-request.json"
+          response_body="${RUNNER_TEMP}/reviewbot-response.json"
+          merge_base=$(git merge-base "${BASE_SHA}" "${HEAD_SHA}")
+
+          build_review_input() {
+            {
+              git show "${BASE_SHA}:.github/codex/prompts/reviewbot.md"
+              printf '\n\n## Trusted policy from the base revision\n\n'
+              git show "${BASE_SHA}:AGENTS.md" || printf 'No AGENTS.md exists at the base revision.\n'
+              printf '\n\n## Pull request metadata\n\n'
+              printf 'Base commit: `%s`\nHead commit: `%s`\nMerge base: `%s`\n\n' "${BASE_SHA}" "${HEAD_SHA}" "${merge_base}"
+              git diff --stat "${merge_base}" "${HEAD_SHA}"
+              printf '\n\n## Unified diff\n\n```diff\n'
+              git diff --no-ext-diff --find-renames --find-copies --unified="${1}" "${merge_base}" "${HEAD_SHA}"
+              printf '\n```\n'
+            } > "${review_input}"
+          }
+          build_review_input 80
+
+          input_limit=750000
+          # Execute only the helper from the immutable trusted workflow revision,
+          # never its potentially modified copy in the PR head worktree.
+          response_parser="${RUNNER_TEMP}/reviewbot-response.py"
+          review_result="${RUNNER_TEMP}/reviewbot-result.json"
+          git show "${TRUSTED_SHA}:.github/codex/reviewbot_response.py" > "${response_parser}"
+          request_deadline=$((SECONDS + 600))
+          for attempt in 1 2; do
+            input_size=$(wc -c < "${review_input}")
+            if (( input_size > input_limit )); then
+              limited_input="${RUNNER_TEMP}/reviewbot-input-limited.txt"
+              head -c "${input_limit}" "${review_input}" > "${limited_input}"
+              printf '\n\n[Review input truncated at %s bytes. Report this as a validation gap.]\n' "${input_limit}" >> "${limited_input}"
+              mv "${limited_input}" "${review_input}"
+            fi
+
+            jq -n \
+              --arg model "${ARK_MODEL}" \
+              --rawfile input "${review_input}" \
+              '{model: $model, input: $input, max_output_tokens: 8192, reasoning: {effort: "medium"}}' \
+              > "${request_body}"
+
+            # Both attempts share the original 600-second HTTP time budget.
+            request_timeout=$((request_deadline - SECONDS))
+            if (( request_timeout <= 0 )); then
+              echo 'ReviewBot reason_code=request_timeout' >&2
+              exit 1
+            fi
+            http_code=$(curl \
+              --silent \
+              --show-error \
+              --connect-timeout 20 \
+              --max-time "${request_timeout}" \
+              --output "${response_body}" \
+              --write-out '%{http_code}' \
+              'https://ark.cn-beijing.volces.com/api/plan/v3/responses' \
+              -H "Authorization: Bearer ${ARK_API_KEY}" \
+              -H 'Content-Type: application/json' \
+              --data-binary "@${request_body}")
+
+            if [[ ! "${http_code}" =~ ^2[0-9][0-9]$ ]]; then
+              if [[ "${http_code}" =~ ^[0-9][0-9][0-9]$ ]]; then
+                echo "ReviewBot reason_code=http_error HTTP ${http_code} (response body omitted)" >&2
+              else
+                echo 'ReviewBot reason_code=http_error invalid_status (response body omitted)' >&2
+              fi
+              exit 1
+            fi
+
+            if python3 "${response_parser}" "${response_body}" "${review_result}" "${ARK_MODEL}"; then
+              break
+            else
+              response_status=$?
+            fi
+            if (( response_status != 10 )); then
+              exit 1
+            fi
+            if (( attempt == 2 )); then
+              echo 'ReviewBot reason_code=retry_exhausted' >&2
+              exit 1
+            fi
+            echo '::notice::ReviewBot output token limit; retrying once with unified=3 diff context.'
+            build_review_input 3
+          done
+
+          review_message=$(jq -r '.message' "${review_result}")
+          if (( attempt == 2 )); then
+            review_message="${review_message}"$'\n\n_Validation gap: ReviewBot retried after an output-token limit with unified=3 diff context (initial unified=80)._'
+          fi
+          model_id_b64=$(jq -r '.model | @base64' "${review_result}")
+          delimiter="REVIEWBOT_$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          {
+            printf 'final_message<<%s\n' "${delimiter}"
+            printf '%s\n' "${review_message}"
+            printf '%s\n' "${delimiter}"
+            printf 'model_id_b64=%s\n' "${model_id_b64}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Remove review input
+        if: always()
+        run: rm -f "${RUNNER_TEMP}"/reviewbot-*
+
+  publish:
+    name: Publish pull request review
+    needs: review
+    if: needs.review.outputs.final_message != ''
+    runs-on: >-
+      ${{ (github.event.pull_request.head.repo.full_name == github.repository &&
+           github.event.pull_request.user.type == 'User') &&
+          fromJSON('["self-hosted","pavu-review"]') || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Create ReviewBot review for commit
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          REVIEWBOT_MESSAGE: ${{ needs.review.outputs.final_message }}
+          MODEL_ID_B64: ${{ needs.review.outputs.model_id_b64 }}
+          REVIEWED_COMMIT: ${{ github.event.pull_request.head.sha }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const message = process.env.REVIEWBOT_MESSAGE.trim();
+            const modelId = Buffer.from(process.env.MODEL_ID_B64, "base64").toString("utf8");
+            const commit = process.env.REVIEWED_COMMIT;
+            const marker = `<!-- pavu-reviewbot:${commit} -->`;
+            const modelFooter = modelId
+              ? `\n\n_Model ID: \`${modelId.replaceAll("`", "\\`").replace(/[\r\n]/g, " ")}\`_`
+              : "";
+            const suffix = `\n\n_Reviewed commit: \`${commit}\`_${modelFooter}`;
+            const maximumLength = 65_000;
+            let body = `${marker}\n${message}${suffix}`;
+
+            if (body.length > maximumLength) {
+              body = `${body.slice(0, maximumLength - 160)}\n\n_ReviewBot output was truncated to fit GitHub's comment limit._${suffix}`;
+            }
+
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = reviews.find(
+              (review) =>
+                review.user?.login === "github-actions[bot]" &&
+                review.body?.includes(marker),
+            );
+
+            if (existing) {
+              core.notice(`ReviewBot already published review ${existing.id} for ${commit}.`);
+              return;
+            }
+
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              commit_id: commit,
+              body,
+              event: "COMMENT",
+            });
