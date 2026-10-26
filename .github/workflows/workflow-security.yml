@@ -1,0 +1,77 @@
+name: Workflow security
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/**"
+  pull_request:
+    paths:
+      - ".github/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workflow-security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  zizmor:
+    name: Audit GitHub Actions workflows
+    # A lightweight check, so it runs on the maintainer's self-hosted Linux
+    # host (pavu-light), not the build Mac. Bot-authored pull requests from
+    # this repository run on a GitHub-hosted runner instead.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: >-
+      ${{ (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository &&
+            github.event.pull_request.user.type == 'User'))
+          && fromJSON('["self-hosted","Linux","pavu-light"]')
+          || fromJSON('["ubuntu-24.04"]') }}
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Download a pinned release and verify its checksum instead of adding a
+      # third-party action to the repository's allowed-actions list.
+      - name: Install zizmor
+        env:
+          ZIZMOR_VERSION: 1.31.0
+          ZIZMOR_SHA256_X64: 95776c59c2d4c0d6e10560647b4830762b8dbcca8d7d9b7469ff227c73a6fee6
+          ZIZMOR_SHA256_ARM64: 99b53699d8fd4f7891a2505d740a6e5b05cd6f3a329e31bad1b8ff24e35d9513
+        run: |
+          case "${RUNNER_ARCH}" in
+            X64) target=x86_64-unknown-linux-gnu; sha256="${ZIZMOR_SHA256_X64}" ;;
+            ARM64) target=aarch64-unknown-linux-gnu; sha256="${ZIZMOR_SHA256_ARM64}" ;;
+            *) echo "Unsupported runner architecture: ${RUNNER_ARCH}" >&2; exit 1 ;;
+          esac
+          archive="${RUNNER_TEMP}/zizmor.tar.gz"
+          bin="${RUNNER_TEMP}/bin"
+          mkdir -p "${bin}"
+          curl -sSfL -o "${archive}" \
+            "https://github.com/zizmorcore/zizmor/releases/download/v${ZIZMOR_VERSION}/zizmor-${target}.tar.gz"
+          echo "${sha256}  ${archive}" | sha256sum --check --strict
+          tar -xzf "${archive}" -C "${bin}" zizmor
+          echo "${bin}" >> "${GITHUB_PATH}"
+
+      # Findings stay in the job log instead of being uploaded as SARIF. Online
+      # audits use the read-only job token to check for known-vulnerable or impostor actions.
+      - name: Run zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: zizmor --format plain .github
+
+      - name: Remove downloaded tools
+        if: always()
+        run: rm -rf "${RUNNER_TEMP}/bin" "${RUNNER_TEMP}/zizmor.tar.gz"

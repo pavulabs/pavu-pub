@@ -1,0 +1,98 @@
+name: Protobuf contract
+
+# Public bootstrap: product sources are not imported yet. Automatic triggers
+# are retained as comments; restore them with the corresponding source trees.
+on:
+#   push:
+#     branches: [main]
+#     paths:
+#       - "core/proto/**"
+#       - "buf.yaml"
+#       - ".github/workflows/proto-ci.yml"
+#   pull_request:
+#     paths:
+#       - "core/proto/**"
+#       - "buf.yaml"
+#       - ".github/workflows/proto-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: proto-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  buf:
+    name: Lint, format, and wire compatibility
+    # A lightweight check, so it runs on the maintainer's self-hosted Linux
+    # host (pavu-light), not the build Mac. Bot-authored pull requests from
+    # this repository run on a GitHub-hosted runner instead.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: >-
+      ${{ (github.event_name != 'pull_request' ||
+           (github.event.pull_request.head.repo.full_name == github.repository &&
+            github.event.pull_request.user.type == 'User'))
+          && fromJSON('["self-hosted","Linux","pavu-light"]')
+          || fromJSON('["ubuntu-24.04"]') }}
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Download a pinned release and verify its checksum instead of adding a
+      # third-party action to the repository's allowed-actions list.
+      - name: Install buf
+        env:
+          BUF_VERSION: 1.74.0
+          BUF_SHA256_X64: 92326d957d613712669fb55f9e4340946a8142a92120e09008459118778273d2
+          BUF_SHA256_ARM64: d42b471501a85dbadb40062960492dd81ce5ca4e413f4133d514d3ae3c0af4df
+        run: |
+          case "${RUNNER_ARCH}" in
+            X64) asset=buf-Linux-x86_64; sha256="${BUF_SHA256_X64}" ;;
+            ARM64) asset=buf-Linux-aarch64; sha256="${BUF_SHA256_ARM64}" ;;
+            *) echo "Unsupported runner architecture: ${RUNNER_ARCH}" >&2; exit 1 ;;
+          esac
+          bin="${RUNNER_TEMP}/bin"
+          mkdir -p "${bin}"
+          curl -sSfL -o "${bin}/buf" \
+            "https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}/${asset}"
+          echo "${sha256}  ${bin}/buf" | sha256sum --check --strict
+          chmod +x "${bin}/buf"
+          echo "${bin}" >> "${GITHUB_PATH}"
+
+      - name: Lint
+        run: buf lint
+
+      - name: Check formatting
+        run: buf format --diff --exit-code
+
+      # Compare against the PR base (or the previous main commit) using its
+      # core/proto directory directly, so the check works even when the base
+      # revision has no buf.yaml.
+      - name: Check wire compatibility
+        env:
+          AGAINST_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [[ -z "${AGAINST_SHA}" || "${AGAINST_SHA}" =~ ^0+$ ]]; then
+            AGAINST_SHA=$(git rev-parse HEAD~1)
+          fi
+          if ! git cat-file -e "${AGAINST_SHA}:core/proto" 2>/dev/null; then
+            echo "::notice::${AGAINST_SHA} has no core/proto; skipping wire compatibility check."
+            exit 0
+          fi
+          buf breaking --against ".git#ref=${AGAINST_SHA},subdir=core/proto"
+
+      - name: Remove downloaded tools
+        if: always()
+        run: rm -rf "${RUNNER_TEMP}/bin"

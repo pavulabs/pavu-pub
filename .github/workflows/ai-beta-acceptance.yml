@@ -1,0 +1,49 @@
+name: AI beta native acceptance
+
+# Preparation only: the coordinator dispatches once after reviewing the exact SHA.
+on:
+  workflow_dispatch:
+    inputs:
+      reviewed_sha:
+        description: "Full reviewed commit SHA of the selected ref; one synthetic identity/job"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ai-beta-native-acceptance
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    name: One synthetic native v2 beta job
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'pavulabs/pavu-pub'
+    # Coordinator host only (maintainer decision 2026-10-25): the private log and
+    # recovery state stay on this host, where the coordinator can review them.
+    runs-on: [self-hosted, macOS, pavu-macos, pavu-coordinator]
+    timeout-minutes: 30
+    env:
+      PAVU_AI_BETA_REVIEWED_SHA: ${{ inputs.reviewed_sha }}
+    steps:
+      - name: Check out reviewed ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run bounded synthetic campaign and report safe markers
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          # No arbitrary ref checkout or endpoint input, no retries, no artifact upload.
+          # Preserve private build/runtime logs and recovery state on failure only.
+          # RUNNER_TEMP is cleared by Actions after a failed job. Keep original
+          # recovery keys/binary beside it, outside checkout/automatic cleanup.
+          pavu_beta_logs=$(mktemp -d "$(dirname "$RUNNER_TEMP")/pavu-ai-beta-recovery.XXXXXXXX")
+          pavu_beta_code=0
+          TMPDIR="$pavu_beta_logs" bash scripts/test-ai-beta-runtime.sh --live-beta-ci \
+            > "$pavu_beta_logs/private.log" 2>&1 || pavu_beta_code=$?
+          python3 scripts/report-ai-beta-acceptance.py "$pavu_beta_logs/private.log" "$pavu_beta_code"
+          rm -rf "$pavu_beta_logs"

@@ -1,0 +1,394 @@
+name: Windows Donkey UI and service acceptance
+
+# Installs, exercises and removes PavuService on Donkey, the maintainer's
+# dedicated Windows test machine, free to use (maintainer, 2026-10-24).
+# donkey-2 (pavu-windows-admin) is elevated; donkey (pavu-windows-normal) is a
+# standard interactive user on the same machine, so it reaches the installed
+# LocalSystem service as another user would.
+# Public bootstrap: product sources are not imported yet. Automatic triggers
+# are retained as comments; restore them with the corresponding source trees.
+on:
+#   pull_request:
+#     types: [opened, synchronize, reopened, ready_for_review]
+#     paths:
+#       - "platforms/windows/**"
+#       - "core/**"
+#       - ".github/workflows/windows-donkey-admin.yml"
+#       - ".github/workflows/windows-ui-ci.yml"
+#       - ".github/workflows/windows-ci.yml"
+#   push:
+#     branches: [main]
+#     paths:
+#       - "platforms/windows/**"
+#       - "core/**"
+#       - ".github/workflows/windows-donkey-admin.yml"
+#       - ".github/workflows/windows-ui-ci.yml"
+#       - ".github/workflows/windows-ci.yml"
+  workflow_dispatch:
+    inputs:
+      simulate_core_only:
+        description: "Exercise service-only gating on a non-main branch (acceptance test)"
+        type: boolean
+        default: false
+      ui_only:
+        description: "Run only the UI job (fast iteration on a branch); skips install and all service jobs"
+        type: boolean
+        default: false
+      force_lifecycle_failure:
+        description: "Non-main service-only regression: fail lifecycle with the service running, then verify cleanup"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# The service is machine-wide state: never run two acceptances at once and
+# never cancel one halfway. The UI job (windows-ui-ci.yml) runs first inside
+# the same run, while no service is installed.
+concurrency:
+  # Only runs that will use the Donkey desktop join the shared group. Draft,
+  # bot and fork pull requests skip every job; give them a private group so
+  # they never take or replace the single pending slot.
+  group: >-
+    ${{ github.event_name == 'pull_request' &&
+        (github.event.pull_request.draft ||
+         github.event.pull_request.head.repo.full_name != github.repository ||
+         github.event.pull_request.user.type != 'User') &&
+        format('donkey-skip-{0}', github.run_id) || 'donkey-desktop' }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: powershell -NoProfile -ExecutionPolicy Bypass -Command ". '{0}'"
+    working-directory: platforms/windows
+
+jobs:
+  changes:
+    name: Classify Windows acceptance scope
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.draft == false &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.user.type == 'User')
+    runs-on: [self-hosted, Linux, pavu-light]
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      core_only: ${{ steps.classify.outputs.core_only }}
+    steps:
+      - name: Install pinned GitHub CLI for this job
+        shell: bash
+        working-directory: .
+        env:
+          GH_VERSION: 2.103.2
+          GH_SHA256_X64: 62ccf747115ddc61237efffdde66a3c8f70ba249433dc64f70801089b59c59c8
+          GH_SHA256_ARM64: 4c3e99a50bd8b181a3fe9d69b25dd978bac768148d88f01507c6b4d1ef61a443
+        run: |
+          case "${RUNNER_ARCH}" in
+            X64) arch=amd64; sha256="${GH_SHA256_X64}" ;;
+            ARM64) arch=arm64; sha256="${GH_SHA256_ARM64}" ;;
+            *) echo "Unsupported runner architecture: ${RUNNER_ARCH}" >&2; exit 1 ;;
+          esac
+          tool="${RUNNER_TEMP}/pavu-gh"
+          mkdir -p "${tool}/bin"
+          package="gh_${GH_VERSION}_linux_${arch}"
+          curl -sSfL -o "${tool}/gh.tar.gz" \
+            "https://github.com/cli/cli/releases/download/v${GH_VERSION}/${package}.tar.gz"
+          echo "${sha256}  ${tool}/gh.tar.gz" | sha256sum --check --strict
+          tar -xzf "${tool}/gh.tar.gz" -C "${tool}/bin" --strip-components=2 "${package}/bin/gh"
+          echo "${tool}/bin" >> "${GITHUB_PATH}"
+
+      # No checkout and no shell interpolation of API-provided filenames.
+      - name: Classify changed files
+        id: classify
+        shell: bash
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIMULATE_CORE_ONLY: ${{ inputs.simulate_core_only }}
+          FORCE_LIFECYCLE_FAILURE: ${{ inputs.force_lifecycle_failure }}
+        run: |
+          python3 <<'PYTHON'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          def api(endpoint, *options):
+              return json.loads(subprocess.check_output(
+                  ["gh", "api", endpoint, *options], text=True))
+
+          core_only = False
+          if os.environ["GITHUB_EVENT_NAME"] == "pull_request":
+              event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+              expected = event["pull_request"]
+              endpoint = f"repos/{os.environ['GITHUB_REPOSITORY']}/pulls/{expected['number']}"
+              pages = api(f"{endpoint}/files?per_page=100", "--paginate", "--slurp")
+              current = api(endpoint)
+              files = [file for page in pages for file in page]
+              # The API caps file lists at 3000. Incomplete lists or a moved
+              # head/base conservatively retain the full UI/MSI chain.
+              complete = (0 < len(files) < 3000
+                          and len(files) == current["changed_files"]
+                          and all(current[ref]["sha"] == expected[ref]["sha"]
+                                  for ref in ("head", "base")))
+              paths = [path for file in files
+                       for path in (file["filename"], file.get("previous_filename", ""))]
+              core = any(path.startswith("core/") for path in paths)
+              windows = any(path.startswith("platforms/windows/") or
+                            (path.startswith(".github/workflows/windows") and
+                             path.endswith((".yml", ".yaml"))) for path in paths)
+              core_only = complete and core and not windows
+          elif (os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
+                and os.environ["GITHUB_REF"] != "refs/heads/main"):
+              core_only = (os.environ.get("SIMULATE_CORE_ONLY") == "true"
+                           or os.environ.get("FORCE_LIFECYCLE_FAILURE") == "true")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"core_only={str(core_only).lower()}\n")
+          print(f"Windows acceptance scope: {'service-only' if core_only else 'full'}")
+          PYTHON
+
+      - name: Remove downloaded GitHub CLI
+        if: always()
+        shell: bash
+        working-directory: .
+        run: rm -rf "${RUNNER_TEMP}/pavu-gh"
+
+  ui:
+    name: UI
+    needs: changes
+    if: >-
+      needs.changes.outputs.core_only != 'true' &&
+      (github.event_name != 'pull_request' ||
+       (github.event.pull_request.draft == false &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.user.type == 'User'))
+    uses: $/.github/workflows/windows-ui-ci.yml
+
+  install:
+    name: Install and start the service (administrator)
+    # After UI, whatever its result, including a deliberate core-only skip.
+    needs: [changes, ui]
+    if: >-
+      !cancelled() && needs.changes.result == 'success' &&
+      !(github.event_name == 'workflow_dispatch' && inputs.ui_only) &&
+      (github.event_name != 'pull_request' ||
+       (github.event.pull_request.draft == false &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.user.type == 'User'))
+    runs-on: [self-hosted, Windows, pavu-windows-admin]
+    timeout-minutes: 30
+    outputs:
+      preflight_candidate_id: ${{ steps.preflight_candidate.outputs.artifact-id }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build release binaries
+        run: cargo build --locked --release -p pavu-windows-service --bins
+
+      - name: Test cleanup failure paths with synthetic operations
+        run: .\acceptance\test-cleanup.ps1
+
+      - name: Remove leftovers from interrupted acceptance and require fresh preflight
+        run: |
+          . .\acceptance\cleanup.ps1
+          $root = Get-DonkeyDataRoot
+          Invoke-DonkeyCleanup $root
+          $preflight = & .\target\release\pavu-windows-cli.exe preflight-install
+          if ($LASTEXITCODE -ne 0 -or $preflight -cne 'windows.preflight.fresh') { throw 'cleanup.next_preflight_failed' }
+          Write-Output 'cleanup.next_preflight.fresh'
+
+      # Before installing: the test starts the service's ETW session name.
+      - name: Run live ETW session test
+        run: cargo test --locked -p pavu-windows-collector -- --ignored
+
+      - name: Install, verify registration and start
+        run: .\acceptance\service.ps1 -Stage install
+
+      # Archive checkout deletes this runner's workspace even with clean:false.
+      # Preflight must compare the installed image with its original candidate,
+      # never a separately linked lifecycle build or the installed image itself.
+      - name: Preserve the exact preflight candidate from installation
+        id: preflight_candidate
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: preflight-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            platforms/windows/target/release/pavu-windows-service.exe
+            platforms/windows/target/release/pavu-windows-cli.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  ordinary:
+    name: Use the installed service as a standard user
+    needs: [ui, install]
+    # Installation may succeed after a failed UI ancestor; still exercise IPC.
+    if: ${{ !cancelled() && needs.install.result == 'success' }}
+    runs-on: [self-hosted, Windows, pavu-windows-normal]
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build release binaries
+        run: cargo build --locked --release -p pavu-windows-service --bins
+
+      - name: Read snapshots and be refused commands and installation
+        run: .\acceptance\service.ps1 -Stage ordinary
+
+      - name: Download this run's archived UI
+        if: needs.ui.result == 'success'
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: pavu-windows-ui-unsigned
+          path: ${{ runner.temp }}/pavu-installed-ui-ordinary
+
+      - name: Verify installed-service UI snapshots and localized mutation refusals
+        if: needs.ui.result == 'success'
+        run: |
+          cargo build --locked --release -p pavu-windows-service --example ui-witness
+          if ($LASTEXITCODE -ne 0) { throw 'UI witness build failed' }
+          $archive = Join-Path $env:RUNNER_TEMP 'pavu-installed-ui-ordinary'
+          Expand-Archive -Path (Join-Path $archive 'Pavu-Windows-x64-unsigned.zip') -DestinationPath (Join-Path $archive 'extracted')
+          powershell.exe -NoProfile -NonInteractive -File .\ui\installed-smoke.ps1 -Stage ordinary -Directory (Join-Path $archive 'extracted\Pavu-Windows-x64')
+          if ($LASTEXITCODE -ne 0) { throw 'Ordinary installed UI acceptance failed' }
+
+      - name: Remove build output
+        if: always()
+        run: |
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue target
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $env:RUNNER_TEMP 'pavu-installed-ui-ordinary')
+
+  installed-ui:
+    name: Installed UI confirm and cancel (administrator)
+    needs: [ui, install, ordinary]
+    # Keep elevated coverage after an ordinary-stage failure: this stage
+    # checks its own token, service health and original settings, and restores
+    # them in finally. Lifecycle cleanup still runs after either UI result.
+    if: ${{ !cancelled() && needs.ui.result == 'success' && needs.install.result == 'success' }}
+    runs-on: [self-hosted, Windows, pavu-windows-admin]
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          clean: false
+
+      - name: Download this run's archived UI
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: pavu-windows-ui-unsigned
+          path: ${{ runner.temp }}/pavu-installed-ui-administrator
+
+      - name: Verify elevated UI confirmation, cancellation and state restoration
+        run: |
+          cargo build --locked --release -p pavu-windows-service --example ui-witness
+          if ($LASTEXITCODE -ne 0) { throw 'UI witness build failed' }
+          $archive = Join-Path $env:RUNNER_TEMP 'pavu-installed-ui-administrator'
+          Expand-Archive -Path (Join-Path $archive 'Pavu-Windows-x64-unsigned.zip') -DestinationPath (Join-Path $archive 'extracted')
+          powershell.exe -NoProfile -NonInteractive -File .\ui\installed-smoke.ps1 -Stage administrator -Directory (Join-Path $archive 'extracted\Pavu-Windows-x64')
+          if ($LASTEXITCODE -ne 0) { throw 'Elevated installed UI acceptance failed' }
+
+      - name: Remove extracted UI
+        if: always()
+        run: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $env:RUNNER_TEMP 'pavu-installed-ui-administrator')
+
+  lifecycle:
+    name: Commands, crash recovery, stop and removal (administrator)
+    needs: [install, ordinary, installed-ui]
+    if: always() && needs.install.result != 'skipped'
+    runs-on: [self-hosted, Windows, pavu-windows-admin]
+    timeout-minutes: 30
+    steps:
+      # Keep the install job's build output on this runner.
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          clean: false
+
+      - name: Build release binaries
+        run: cargo build --locked --release -p pavu-windows-service --bins
+
+      - name: Test startup-failure event validation with synthetic data
+        run: .\acceptance\test-startup-failure.ps1
+
+      - name: Build the in-memory synthetic restoration witness
+        run: cargo build --locked --release -p pavu-windows-service --example service-witness
+
+      - name: Commands, SQLite crash restoration, queue drain and stop
+        if: needs.install.result == 'success'
+        env:
+          FORCE_LIFECYCLE_FAILURE: ${{ github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main' && inputs.force_lifecycle_failure }}
+        run: |
+          if ($env:FORCE_LIFECYCLE_FAILURE -eq 'true') { throw 'acceptance.forced_lifecycle_failure' }
+          .\acceptance\service.ps1 -Stage lifecycle
+
+      - name: Restore the original preflight candidate by artifact ID
+        if: needs.install.result == 'success'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.install.outputs.preflight_candidate_id }}
+          merge-multiple: true
+          path: platforms/windows/target/preflight-candidate
+          digest-mismatch: error
+
+      - name: Inspect installer preflight and refuse isolated foreign state
+        if: needs.install.result == 'success'
+        run: .\acceptance\preflight.ps1 -Release target\preflight-candidate
+
+      - name: Verify controlled startup failure and private-safe Event Log
+        if: needs.install.result == 'success'
+        run: .\acceptance\service.ps1 -Stage startup-failure
+
+  cleanup:
+    name: Remove service, ETW and acceptance data (administrator)
+    needs: [install, ordinary, installed-ui, lifecycle]
+    # Independent of lifecycle checkout/build/step success, including timeout
+    # and cancellation. UI-only/draft/fork/bot runs never touch service state.
+    if: always() && needs.install.result != 'skipped'
+    runs-on: [self-hosted, Windows, pavu-windows-admin]
+    timeout-minutes: 10
+    steps:
+      - name: Check out cleanup harness
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Always remove and verify acceptance state without build output
+        if: always()
+        run: |
+          . .\acceptance\cleanup.ps1
+          $root = Get-DonkeyDataRoot
+          Invoke-DonkeyCleanup $root
+          # A second invocation proves the absent-state path is idempotent.
+          Invoke-DonkeyCleanup $root
+
+      - name: Download candidate for next-preflight verification
+        if: needs.install.outputs.preflight_candidate_id != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.install.outputs.preflight_candidate_id }}
+          merge-multiple: true
+          path: platforms/windows/target/preflight-candidate
+          digest-mismatch: error
+
+      - name: Verify the next installer preflight sees fresh state
+        if: needs.install.outputs.preflight_candidate_id != ''
+        run: |
+          $preflight = & .\target\preflight-candidate\pavu-windows-cli.exe preflight-install
+          if ($LASTEXITCODE -ne 0 -or $preflight -cne 'windows.preflight.fresh') { throw 'cleanup.next_preflight_failed' }
+          Write-Output 'cleanup.next_preflight.fresh'
+
+      - name: Remove build output
+        if: always()
+        run: Remove-Item -Recurse -Force -ErrorAction SilentlyContinue target

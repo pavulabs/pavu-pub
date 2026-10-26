@@ -1,0 +1,198 @@
+name: macOS CI
+
+# Public bootstrap: product sources are not imported yet. Automatic triggers
+# are retained as comments; restore them with the corresponding source trees.
+on:
+#   push:
+#     branches: [main]
+#     paths:
+#       - "core/**"
+#       - "Pavu/**"
+#       - "PavuNetworkExtension/**"
+#       - "Shared/**"
+#       - "Sources/**"
+#       - "Tests/**"
+#       - "scripts/test-platform.sh"
+#       - "scripts/test-ai-keychain-sandbox.sh"
+#       - "scripts/run-ai-keychain-fixture.py"
+#       - "scripts/tests/test_ai_keychain_fixture.py"
+#       - "scripts/test-ai-beta-runtime.sh"
+#       - "scripts/prepare-ai-beta-acceptance.py"
+#       - "scripts/report-ai-beta-acceptance.py"
+#       - "scripts/tests/test_ai_beta_variant.py"
+#       - "Package.swift"
+#       - "Pavu.xcodeproj/**"
+#       - ".github/workflows/macos-ci.yml"
+#       - ".github/workflows/ai-beta-acceptance.yml"
+#   pull_request:
+#     paths:
+#       - "core/**"
+#       - "Pavu/**"
+#       - "PavuNetworkExtension/**"
+#       - "Shared/**"
+#       - "Sources/**"
+#       - "Tests/**"
+#       - "scripts/test-platform.sh"
+#       - "scripts/test-ai-keychain-sandbox.sh"
+#       - "scripts/run-ai-keychain-fixture.py"
+#       - "scripts/tests/test_ai_keychain_fixture.py"
+#       - "scripts/test-ai-beta-runtime.sh"
+#       - "scripts/prepare-ai-beta-acceptance.py"
+#       - "scripts/report-ai-beta-acceptance.py"
+#       - "scripts/tests/test_ai_beta_variant.py"
+#       - "Package.swift"
+#       - "Pavu.xcodeproj/**"
+#       - ".github/workflows/macos-ci.yml"
+#       - ".github/workflows/ai-beta-acceptance.yml"
+  workflow_dispatch:
+    inputs:
+      generate_protobuf:
+        description: "Regenerate Swift Protobuf with the locked compiler and upload the sources"
+        type: boolean
+        default: false
+
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Xcode build and CLI smoke test
+    # Runs on the maintainer's shared self-hosted Mac pool. Only pull requests opened by
+    # a person from a branch of this repository run on it. There is no
+    # GitHub-hosted fallback (maintainer decision: no hosted macOS minutes; the
+    # hosted images' Xcode also could not open the project), so bot-authored
+    # and fork pull requests skip it. Before merging, a maintainer runs this
+    # workflow with workflow_dispatch on the bot's branch, or, for a fork, on a
+    # repository branch holding the reviewed head. The Xcode version is
+    # whatever xcode-select selects on the runner.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.user.type == 'User')
+    runs-on: [self-hosted, macOS, pavu-macos]
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Report toolchain versions
+        run: |
+          xcodebuild -version
+          swift --version
+          rustc --version
+          cargo --version
+
+      - name: Resolve Swift packages
+        run: |
+          xcodebuild \
+            -project Pavu.xcodeproj \
+            -scheme Pavu \
+            -resolvePackageDependencies \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages"
+
+      - name: Generate Swift Protobuf sources with the locked toolchain
+        if: github.event_name == 'workflow_dispatch' && inputs.generate_protobuf
+        run: |
+          set -euo pipefail
+          package="$RUNNER_TEMP/SourcePackages/checkouts/swift-protobuf"
+          test "$(git -C "$package" rev-parse HEAD)" = "55d7a1cc5666b85c13464aea1c4b4a90feccb4c8"
+          swift build --package-path "$package" --configuration release --product protoc-gen-swift
+          cargo fetch --locked --manifest-path core/Cargo.toml
+          case "$(uname -m)" in
+            arm64) platform=macos-aarch_64 ;;
+            x86_64) platform=macos-x86_64 ;;
+            *) echo 'Unsupported protoc host architecture' >&2; exit 1 ;;
+          esac
+          protoc_dir=
+          for candidate in "${CARGO_HOME:-$HOME/.cargo}"/registry/src/*/protoc-bin-vendored-"$platform"-3.3.0/bin; do
+            if [[ -x "$candidate/protoc" ]]; then protoc_dir="$candidate"; break; fi
+          done
+          test -n "$protoc_dir"
+          export PATH="$package/.build/release:$protoc_dir:$PATH"
+          scripts/generate-swift-protobuf.sh
+
+      - name: Upload regenerated Swift Protobuf sources
+        if: github.event_name == 'workflow_dispatch' && inputs.generate_protobuf
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: generated-swift-protobuf
+          path: Shared/Generated/*.pb.swift
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Verify every generated Swift Protobuf source is committed
+        if: github.event_name == 'workflow_dispatch' && inputs.generate_protobuf
+        run: |
+          # Keep the artifact available even when regeneration exposes drift.
+          git diff --exit-code -- Shared/Generated/
+          if [[ -n "$(git ls-files --others --exclude-standard -- Shared/Generated/)" ]]; then
+            echo 'Regeneration produced uncommitted Swift Protobuf sources' >&2
+            exit 1
+          fi
+
+      - name: Build macOS app without signing
+        run: |
+          xcodebuild \
+            -quiet \
+            -project Pavu.xcodeproj \
+            -scheme Pavu \
+            -configuration Debug \
+            -destination "platform=macOS" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages" \
+            -derivedDataPath "$RUNNER_TEMP/PavuDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            DEVELOPMENT_TEAM= \
+            build
+
+      - name: Run CLI smoke test
+        run: |
+          output=$(swift run --configuration debug pavu)
+          test "$output" = "hello Pavu"
+
+      - name: Build Release without signing
+        run: |
+          xcodebuild \
+            -quiet \
+            -project Pavu.xcodeproj \
+            -scheme Pavu \
+            -configuration Release \
+            -destination "platform=macOS" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages" \
+            -derivedDataPath "$RUNNER_TEMP/PavuDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            DEVELOPMENT_TEAM= \
+            build
+
+      - name: Run platform boundary regression checks
+        run: bash scripts/test-platform.sh
+
+      # The runner is persistent and short on disk: remove build output even
+      # when an earlier step fails.
+      # Xcode registers each built app with LaunchServices; drop those records
+      # before the bundles go, so copies of org.pavu do not pile up (#97).
+      - name: Unregister build copies from LaunchServices
+        if: always()
+        # Skipped when an earlier failure left no checkout, so it adds no
+        # second error.
+        run: |
+          [[ -f scripts/unregister-runner-builds.sh ]] || exit 0
+          bash scripts/unregister-runner-builds.sh
+
+      - name: Remove build output
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/PavuDerivedData" "$RUNNER_TEMP/SourcePackages" core/target .build

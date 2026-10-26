@@ -1,0 +1,157 @@
+name: Linux privileged L2 acceptance
+
+# Public bootstrap: product sources are not imported yet. Automatic triggers
+# are retained as comments; restore them with the corresponding source trees.
+on:
+  workflow_dispatch:
+#   pull_request:
+#     types: [opened, synchronize, ready_for_review]
+#     paths:
+#       - ".github/workflows/linux-privileged-acceptance.yml"
+#       - "platforms/linux/tests/privileged*"
+#       - "platforms/linux/tests/test_privileged*"
+
+permissions:
+  contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+# One privileged acceptance at a time on the shared host. Never cancel cleanup.
+concurrency:
+  group: charming-linux-privileged-acceptance
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  privilege-probe:
+    name: Linux privileged runner identity (read-only)
+    if: >-
+      github.repository == 'pavulabs/pavu-pub' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.user.type == 'User'))
+    runs-on: [self-hosted, Linux, pavu-linux-root]
+    timeout-minutes: 2
+    steps:
+      - name: Detect existing root or passwordless sudo (no host changes)
+        run: |
+          uid="$(id -u)"
+          printf 'Runner uid: %s\n' "${uid}"
+          if [[ "${uid}" == 0 ]]; then
+            echo 'Privilege mode: root'
+          elif sudo -n true; then
+            echo 'Privilege mode: passwordless sudo'
+          else
+            echo 'Privileged acceptance requires uid 0 or existing passwordless sudo.' >&2
+            exit 1
+          fi
+          uname -srmo
+          missing=()
+          for tool in bpftool ip unshare timeout python3; do
+            command -v "${tool}" || missing+=("${tool}")
+          done
+          if (( ${#missing[@]} )); then
+            printf 'Missing acceptance prerequisite (no installation attempted): %s\n' "${missing[@]}" >&2
+            exit 1
+          fi
+
+  build:
+    name: Build Linux L2 acceptance binaries (unprivileged)
+    if: >-
+      github.repository == 'pavulabs/pavu-pub' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.user.type == 'User'))
+    runs-on: [self-hosted, Linux, pavu-linux]
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact tested revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Build with existing pinned toolchain (no host changes)
+        working-directory: platforms/linux
+        env:
+          RUSTUP_TOOLCHAIN: 1.99.1
+        run: |
+          python3 -m unittest discover -s tests -p 'test_privileged_acceptance.py' -v
+          # Unlike a cargo +version proxy, rustup run without --install cannot
+          # install a missing toolchain into the runners' shared Rust home.
+          rustup run "${RUSTUP_TOOLCHAIN}" cargo --version
+          installed="$(rustup component list --installed --toolchain "${RUSTUP_TOOLCHAIN}")"
+          for component in cargo rustc rust-std rustfmt; do
+            if ! awk -v component="${component}" '
+              $1 == component || index($1, component "-") == 1 { found = 1 }
+              END { exit !found }' <<< "${installed}"; then
+              echo "Missing preinstalled Rust component: ${component}; maintainer provisioning required." >&2
+              exit 1
+            fi
+          done
+          rustup run "${RUSTUP_TOOLCHAIN}" cargo build --locked -p pavu-linux-collector -p pavu-linux-agent
+          tar -C target/debug -czf "${RUNNER_TEMP}/pavu-l2-binaries.tar.gz" pavu-linux-collector pavu-linux-agent
+      - name: Upload only this run's binaries
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-l2-acceptance-binaries
+          path: ${{ runner.temp }}/pavu-l2-binaries.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+      - name: Remove owned build output
+        if: always()
+        run: rm -rf platforms/linux/target core/target "${RUNNER_TEMP}/pavu-l2-binaries.tar.gz"
+
+  acceptance:
+    name: Linux privileged L2 kernel acceptance
+    needs: [privilege-probe, build]
+    if: >-
+      github.repository == 'pavulabs/pavu-pub' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.user.type == 'User' &&
+        github.event.pull_request.draft == false))
+    runs-on: [self-hosted, Linux, pavu-linux-root]
+    timeout-minutes: 5
+    steps:
+      - name: Check out exact tested revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Download only this run's build
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: linux-l2-acceptance-binaries
+          path: ${{ runner.temp }}/pavu-l2-download
+      - name: Run private namespace acceptance with guaranteed process cleanup
+        run: |
+          umask 077
+          privilege=()
+          if [[ "$(id -u)" != 0 ]]; then
+            sudo -n true
+            privilege=(sudo -n)
+          fi
+          test_dir="$(mktemp -d /tmp/pavu-l2-bin.XXXXXX)"
+          cleanup() {
+            "${privilege[@]}" rm -rf -- "${test_dir}"
+          }
+          trap cleanup EXIT
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          tar -xzf "${RUNNER_TEMP}/pavu-l2-download/pavu-l2-binaries.tar.gz" -C "${test_dir}"
+          "${privilege[@]}" chown 0:0 "${test_dir}"
+          chmod 711 "${test_dir}"
+          chmod 755 "${test_dir}/pavu-linux-collector" "${test_dir}/pavu-linux-agent"
+          git rev-parse HEAD
+          "${privilege[@]}" timeout --signal=TERM --kill-after=15s 180s \
+            unshare --net python3 platforms/linux/tests/privileged_acceptance.py \
+              --collector "${test_dir}/pavu-linux-collector" \
+              --agent "${test_dir}/pavu-linux-agent" \
+              --scratch-dir "${test_dir}"
+      - name: Remove downloaded binaries
+        if: always()
+        run: rm -rf "${RUNNER_TEMP}/pavu-l2-download"

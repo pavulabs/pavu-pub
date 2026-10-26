@@ -1,0 +1,340 @@
+name: Nightly full regression
+
+# Public bootstrap: product sources are not imported yet. Automatic triggers
+# are retained as comments; restore them with the corresponding source trees.
+on:
+#   schedule:
+#     # 03:17 Asia/Shanghai; scheduled runs use the default branch (main).
+#     - cron: "17 19 * * *"
+  workflow_dispatch:
+  # Validate changes to the nightly itself before they reach main.
+#   pull_request:
+#     paths:
+#       - ".github/workflows/nightly-regression.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-regression-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  LINUX_RUST_STABLE: "1.99.1"
+  MINIMUM_RUST: "1.89.0"
+
+jobs:
+  regression:
+    name: Full regression (${{ matrix.platform }})
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.user.type == 'User')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macOS
+            runner: [self-hosted, macOS, pavu-macos]
+            rust: stable
+          - platform: Linux
+            runner: [self-hosted, Linux, pavu-linux]
+            rust: "1.99.1"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      CORE_RUST: ${{ matrix.rust }}
+    steps:
+      - name: Check out repository
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check Linux build prerequisites (no host changes)
+        id: prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          missing=()
+          for package in clang libelf-dev zlib1g-dev pkg-config dpkg-dev binutils jq python3 util-linux; do
+            if [[ "$(dpkg-query -W -f='${Status}' "${package}" 2>/dev/null || true)" != 'install ok installed' ]]; then
+              missing+=("${package}")
+            fi
+          done
+          if (( ${#missing[@]} )); then
+            printf 'Missing prerequisite package: %s\n' "${missing[@]}" >&2
+            printf 'Maintainer action required: apt install' >&2
+            printf ' %s' "${missing[@]}" >&2
+            printf '\n' >&2
+            exit 1
+          fi
+          cat /etc/os-release
+          uname -r
+          clang --version
+          pkg-config --modversion libelf zlib
+          command -v rustup cargo rustc flock
+          rustup --version
+
+      - name: Configure pinned Linux Rust toolchains
+        id: linux_rust
+        if: runner.os == 'Linux'
+        run: |
+          toolchain_ready() {
+            local installed component
+            rustup toolchain list | awk -v version="${toolchain}" '
+              $1 == version || index($1, version "-") == 1 { found = 1 }
+              END { exit !found }' || return 1
+            installed="$(rustup component list --installed --toolchain "${toolchain}")" || return 1
+            for component in cargo rustc rust-std rustfmt clippy; do
+              awk -v component="${component}" '
+                $1 == component || index($1, component "-") == 1 { found = 1 }
+                END { exit !found }' <<< "${installed}" || return 1
+            done
+          }
+          for toolchain in "${LINUX_RUST_STABLE}" "${MINIMUM_RUST}"; do
+            if ! toolchain_ready; then
+              # Same lock as linux-ci.yml and Core CI; both runners share Rust state.
+              mkdir -p "${RUSTUP_HOME:-$HOME/.rustup}"
+              (
+                flock 9
+                if ! toolchain_ready; then
+                  rustup toolchain install "${toolchain}" --profile minimal --component cargo,rustc,rust-std,rustfmt,clippy --no-self-update
+                fi
+              ) 9>"${RUSTUP_HOME:-$HOME/.rustup}/.pavu-ci.lock"
+            fi
+            cargo +"${toolchain}" --version
+            rustc +"${toolchain}" --version
+          done
+
+      - name: Report macOS tools and configure minimum Rust
+        id: macos_rust
+        if: runner.os == 'macOS'
+        run: |
+          xcodebuild -version
+          swift --version
+          cargo +stable --version
+          cargo +stable fmt --version
+          cargo +stable clippy --version
+          # App builds and native fixtures retain macos-ci.yml's default Rust.
+          rustc --version
+          cargo --version
+          rustup toolchain install "${MINIMUM_RUST}" --profile minimal --no-self-update
+
+      - name: Check Core formatting
+        id: format
+        if: ${{ !cancelled() && (steps.linux_rust.outcome == 'success' || steps.macos_rust.outcome == 'success') }}
+        working-directory: core
+        run: cargo +"${CORE_RUST}" fmt --all -- --check
+
+      - name: Run Core Clippy
+        id: clippy
+        if: ${{ !cancelled() && (steps.linux_rust.outcome == 'success' || steps.macos_rust.outcome == 'success') }}
+        working-directory: core
+        run: cargo +"${CORE_RUST}" clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Verify packaged public data and signing requirements
+        id: catalog
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        run: |
+          python3 -m unittest discover -s scripts/tests -p test_ai_catalog_signatures.py
+          python3 scripts/verify-public-catalog.py
+          python3 scripts/verify-ai-assets.py
+
+      - name: Run all Core workspace tests (including regression scenarios)
+        id: core_tests
+        if: ${{ !cancelled() && (steps.linux_rust.outcome == 'success' || steps.macos_rust.outcome == 'success') }}
+        working-directory: core
+        run: cargo +"${CORE_RUST}" test --locked --workspace
+
+      - name: Fetch checksum-pinned databases for ignored GeoIP tests
+        id: geoip
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
+        env:
+          PAVU_GEOIP_CACHE: ${{ runner.temp }}/nightly-geoip-cache
+        run: bash scripts/fetch-geoip.sh
+
+      - name: Run ignored Core tests and memory budget in release
+        id: ignored_tests
+        if: ${{ !cancelled() && steps.geoip.outcome == 'success' && (steps.linux_rust.outcome == 'success' || steps.macos_rust.outcome == 'success') }}
+        working-directory: core
+        env:
+          PAVU_GEOIP_DIR: ${{ github.workspace }}/build/geoip
+        run: cargo +"${CORE_RUST}" test --locked --release --workspace -- --ignored --nocapture
+
+      - name: Check Core with minimum Rust
+        id: minimum
+        if: ${{ !cancelled() && (steps.linux_rust.outcome == 'success' || steps.macos_rust.outcome == 'success') }}
+        working-directory: core
+        run: cargo +"${MINIMUM_RUST}" check --locked --workspace --all-targets
+
+      # Keep these build/smoke/cleanup commands aligned with macos-ci.yml.
+      - name: Resolve Swift packages
+        id: swift_packages
+        if: ${{ !cancelled() && runner.os == 'macOS' && steps.macos_rust.outcome == 'success' }}
+        run: |
+          xcodebuild \
+            -project Pavu.xcodeproj \
+            -scheme Pavu \
+            -resolvePackageDependencies \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages"
+
+      - name: Build macOS app without signing
+        id: debug_build
+        if: ${{ !cancelled() && steps.swift_packages.outcome == 'success' }}
+        run: |
+          xcodebuild \
+            -quiet \
+            -project Pavu.xcodeproj \
+            -scheme Pavu \
+            -configuration Debug \
+            -destination "platform=macOS" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages" \
+            -derivedDataPath "$RUNNER_TEMP/PavuDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            DEVELOPMENT_TEAM= \
+            build
+
+      - name: Run CLI smoke test
+        id: cli
+        if: ${{ !cancelled() && runner.os == 'macOS' && steps.macos_rust.outcome == 'success' }}
+        run: |
+          output=$(swift run --configuration debug pavu)
+          test "$output" = "hello Pavu"
+
+      - name: Build Release without signing
+        id: release_build
+        if: ${{ !cancelled() && steps.swift_packages.outcome == 'success' }}
+        run: |
+          xcodebuild \
+            -quiet \
+            -project Pavu.xcodeproj \
+            -scheme Pavu \
+            -configuration Release \
+            -destination "platform=macOS" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/SourcePackages" \
+            -derivedDataPath "$RUNNER_TEMP/PavuDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            DEVELOPMENT_TEAM= \
+            build
+
+      - name: Run platform boundary regression checks
+        id: platform
+        if: ${{ !cancelled() && runner.os == 'macOS' && steps.macos_rust.outcome == 'success' }}
+        env:
+          # Match Core's release workaround for rust-lang/rust#157750: the
+          # native fixture disables debug info, which otherwise strips host
+          # proc-macro dylibs into a format macOS 27 rejects on older Rust.
+          CARGO_PROFILE_DEV_STRIP: none
+        run: bash scripts/test-platform.sh
+
+      - name: Check Linux prototype format, lint, and unprivileged tests
+        id: linux_tests
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.linux_rust.outcome == 'success' }}
+        working-directory: platforms/linux
+        run: |
+          cargo +"${CORE_RUST}" fmt --all -- --check
+          cargo +"${CORE_RUST}" clippy --locked --workspace --all-targets -- -D warnings
+          cargo +"${CORE_RUST}" test --locked --workspace
+
+      - name: Record native Linux build and package dependency evidence
+        id: linux_build
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.linux_rust.outcome == 'success' }}
+        working-directory: platforms/linux
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.LINUX_RUST_STABLE }}
+        run: |
+          umask 077
+          tests/build-evidence.sh
+
+      - name: Test package artifact selection with relocated Cargo output
+        id: linux_artifacts
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.checkout.outcome == 'success' }}
+        working-directory: platforms/linux
+        run: python3 tests/test_package_artifacts.py
+
+      - name: Upload Linux build evidence (not a release package)
+        id: evidence
+        if: ${{ !cancelled() && steps.linux_build.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nightly-linux-build-evidence-mint-22.3-amd64
+          path: platforms/linux/dist/build-evidence/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Unregister macOS build copies from LaunchServices
+        id: unregister
+        if: always() && runner.os == 'macOS'
+        run: |
+          [[ -f scripts/unregister-runner-builds.sh ]] || exit 0
+          bash scripts/unregister-runner-builds.sh
+
+      - name: Remove build and package output
+        id: cleanup
+        if: always()
+        run: |
+          rm -rf core/target platforms/linux/target platforms/linux/dist build/geoip .build
+          rm -rf "$RUNNER_TEMP/PavuDerivedData" "$RUNNER_TEMP/SourcePackages" "$RUNNER_TEMP/nightly-geoip-cache"
+
+      - name: Summarize suites and failures
+        if: always()
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          COMMON_RESULTS: |
+            Checkout=${{ steps.checkout.outcome }}
+            Core formatting=${{ steps.format.outcome }}
+            Core Clippy=${{ steps.clippy.outcome }}
+            Catalog and signing assets=${{ steps.catalog.outcome }}
+            Core workspace regression=${{ steps.core_tests.outcome }}
+            GeoIP database preparation=${{ steps.geoip.outcome }}
+            Ignored Core tests and memory budget=${{ steps.ignored_tests.outcome }}
+            Core minimum Rust=${{ steps.minimum.outcome }}
+            Cleanup=${{ steps.cleanup.outcome }}
+          MACOS_RESULTS: |
+            macOS toolchains=${{ steps.macos_rust.outcome }}
+            Swift package resolution=${{ steps.swift_packages.outcome }}
+            macOS Debug build=${{ steps.debug_build.outcome }}
+            CLI smoke=${{ steps.cli.outcome }}
+            macOS Release build=${{ steps.release_build.outcome }}
+            Platform boundary regression=${{ steps.platform.outcome }}
+            LaunchServices cleanup=${{ steps.unregister.outcome }}
+          LINUX_RESULTS: |
+            Linux prerequisites=${{ steps.prerequisites.outcome }}
+            Linux toolchains=${{ steps.linux_rust.outcome }}
+            Linux prototype tests=${{ steps.linux_tests.outcome }}
+            Linux build evidence=${{ steps.linux_build.outcome }}
+            Linux artifact selection=${{ steps.linux_artifacts.outcome }}
+            Linux evidence upload=${{ steps.evidence.outcome }}
+        run: |
+          results="${COMMON_RESULTS}"
+          if [[ "${PLATFORM}" == macOS ]]; then
+            results+="${MACOS_RESULTS}"
+          else
+            results+="${LINUX_RESULTS}"
+          fi
+          {
+            printf '## Full regression (%s)\n\n' "${PLATFORM}"
+            printf '| Suite | Result |\n| --- | --- |\n'
+            failures=()
+            while IFS='=' read -r suite result; do
+              [[ -n "${suite}" ]] || continue
+              printf '| %s | %s |\n' "${suite}" "${result}"
+              if [[ "${result}" == failure || "${result}" == cancelled ]]; then
+                failures+=("${suite}")
+              fi
+            done <<< "${results}"
+            printf '\n### Failing suites\n\n'
+            if (( ${#failures[@]} )); then
+              printf -- '- %s\n' "${failures[@]}"
+            else
+              printf 'None. Skipped suites above are not passes.\n'
+            fi
+            printf '\nUnprivileged regression/build evidence only; no installed-service, eBPF or signed-runtime acceptance.\n'
+          } >> "${GITHUB_STEP_SUMMARY}"

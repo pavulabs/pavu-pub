@@ -1,0 +1,241 @@
+name: Linux prototype CI
+
+# Public bootstrap: product sources are not imported yet. Automatic triggers
+# are retained as comments; restore them with the corresponding source trees.
+on:
+#   push:
+#     branches: [main]
+#     paths:
+#       - "platforms/linux/**"
+#       - "core/**"
+#       - ".github/workflows/linux-ci.yml"
+#   pull_request:
+#     paths:
+#       - "platforms/linux/**"
+#       - "core/**"
+#       - ".github/workflows/linux-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  LINUX_RUST_STABLE: "1.99.1"
+  LINUX_RUST_MINIMUM: "1.89.0"
+
+jobs:
+  quality:
+    name: Linux format, lint, and tests
+    # Maintainer decision (2026-10-24): charming-1/charming-2, no hosted fallback.
+    # Reviewed bot/fork heads require dispatch on a repository branch.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.user.type == 'User')
+    runs-on: [self-hosted, Linux, pavu-linux]
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check build prerequisites (no host changes)
+        run: |
+          missing=()
+          for package in clang libelf-dev zlib1g-dev pkg-config dpkg-dev binutils jq python3 util-linux; do
+            if [[ "$(dpkg-query -W -f='${Status}' "${package}" 2>/dev/null || true)" != 'install ok installed' ]]; then
+              missing+=("${package}")
+            fi
+          done
+          if (( ${#missing[@]} )); then
+            printf 'Missing prerequisite package: %s\n' "${missing[@]}" >&2
+            printf 'Maintainer action required: apt install' >&2
+            printf ' %s' "${missing[@]}" >&2
+            printf '\n' >&2
+            exit 1
+          fi
+          cat /etc/os-release
+          uname -r
+          clang --version
+          pkg-config --modversion libelf zlib
+      - name: Check system Rust tools
+        run: |
+          command -v rustup cargo rustc flock
+          rustup --version
+      - name: Configure Rust
+        run: |
+          toolchain="${LINUX_RUST_STABLE}"
+          toolchain_ready() {
+            local installed component
+            rustup toolchain list | awk -v version="${toolchain}" '
+              $1 == version || index($1, version "-") == 1 { found = 1 }
+              END { exit !found }' || return 1
+            installed="$(rustup component list --installed --toolchain "${toolchain}")" || return 1
+            for component in cargo rustc rust-std rustfmt clippy; do
+              awk -v component="${component}" '
+                $1 == component || index($1, component "-") == 1 { found = 1 }
+                END { exit !found }' <<< "${installed}" || return 1
+            done
+          }
+          if ! toolchain_ready; then
+            # Both runners share Rust state; recheck after taking the host-wide lock.
+            mkdir -p "${RUSTUP_HOME:-$HOME/.rustup}"
+            exec 9>"${RUSTUP_HOME:-$HOME/.rustup}/.pavu-ci.lock"
+            flock 9
+            if ! toolchain_ready; then
+              rustup toolchain install "${toolchain}" --profile minimal --component cargo,rustc,rust-std,rustfmt,clippy --no-self-update
+            fi
+          fi
+          cargo +"${toolchain}" --version
+          rustc +"${toolchain}" --version
+      - name: Check format, lint, and unprivileged tests
+        working-directory: platforms/linux
+        run: |
+          cargo +"${LINUX_RUST_STABLE}" fmt --all -- --check
+          cargo +"${LINUX_RUST_STABLE}" clippy --locked --workspace --all-targets -- -D warnings
+          cargo +"${LINUX_RUST_STABLE}" test --locked --workspace
+      - name: Record native build and package dependency evidence
+        working-directory: platforms/linux
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.LINUX_RUST_STABLE }}
+        run: |
+          umask 077
+          tests/build-evidence.sh
+      - name: Test package artifact selection with relocated Cargo output
+        working-directory: platforms/linux
+        run: python3 tests/test_package_artifacts.py
+      - name: Upload build evidence (not a release package)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-build-evidence-mint-22.3-amd64
+          path: platforms/linux/dist/build-evidence/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove build and package output
+        if: always()
+        run: rm -rf platforms/linux/target platforms/linux/dist core/target
+
+  minimum-rust:
+    name: Linux minimum Rust 1.89
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.user.type == 'User')
+    runs-on: [self-hosted, Linux, pavu-linux]
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check build prerequisites (no host changes)
+        run: |
+          missing=()
+          for package in clang libelf-dev zlib1g-dev pkg-config util-linux; do
+            if [[ "$(dpkg-query -W -f='${Status}' "${package}" 2>/dev/null || true)" != 'install ok installed' ]]; then
+              missing+=("${package}")
+            fi
+          done
+          if (( ${#missing[@]} )); then
+            printf 'Missing prerequisite package: %s\n' "${missing[@]}" >&2
+            printf 'Maintainer action required: apt install' >&2
+            printf ' %s' "${missing[@]}" >&2
+            printf '\n' >&2
+            exit 1
+          fi
+          cat /etc/os-release
+          uname -r
+          clang --version
+          pkg-config --modversion libelf zlib
+      - name: Check system Rust tools
+        run: |
+          command -v rustup cargo rustc flock
+          rustup --version
+      # libbpf-cargo runs rustfmt on the generated BPF skeleton in build.rs.
+      - name: Configure minimum supported Rust
+        run: |
+          toolchain="${LINUX_RUST_MINIMUM}"
+          toolchain_ready() {
+            local installed component
+            rustup toolchain list | awk -v version="${toolchain}" '
+              $1 == version || index($1, version "-") == 1 { found = 1 }
+              END { exit !found }' || return 1
+            installed="$(rustup component list --installed --toolchain "${toolchain}")" || return 1
+            for component in cargo rustc rust-std rustfmt; do
+              awk -v component="${component}" '
+                $1 == component || index($1, component "-") == 1 { found = 1 }
+                END { exit !found }' <<< "${installed}" || return 1
+            done
+          }
+          if ! toolchain_ready; then
+            mkdir -p "${RUSTUP_HOME:-$HOME/.rustup}"
+            exec 9>"${RUSTUP_HOME:-$HOME/.rustup}/.pavu-ci.lock"
+            flock 9
+            if ! toolchain_ready; then
+              rustup toolchain install "${toolchain}" --profile minimal --component cargo,rustc,rust-std,rustfmt --no-self-update
+            fi
+          fi
+          cargo +"${toolchain}" --version
+          rustc +"${toolchain}" --version
+      - name: Check workspace with minimum Rust
+        working-directory: platforms/linux
+        run: cargo +"${LINUX_RUST_MINIMUM}" check --locked --workspace --all-targets
+
+      - name: Remove build output
+        if: always()
+        run: rm -rf platforms/linux/target core/target
+
+  dependency-policy:
+    name: Linux dependency security and licenses
+    # Use the existing checksum-verified binary path on pavu-light, not Docker
+    # on the build hosts. This workflow never falls back to hosted Linux.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.user.type == 'User')
+    runs-on: [self-hosted, Linux, pavu-light]
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install cargo-deny
+        env:
+          CARGO_DENY_VERSION: 0.20.2
+          CARGO_DENY_SHA256_X64: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+          CARGO_DENY_SHA256_ARM64: 995c82be0defc7a025cae49a2aa2644ce8245c9a3318fc4103907c6a285e8c7d
+        run: |
+          case "${RUNNER_ARCH}" in
+            X64) target=x86_64-unknown-linux-musl; sha256="${CARGO_DENY_SHA256_X64}" ;;
+            ARM64) target=aarch64-unknown-linux-musl; sha256="${CARGO_DENY_SHA256_ARM64}" ;;
+            *) echo "Unsupported runner architecture: ${RUNNER_ARCH}" >&2; exit 1 ;;
+          esac
+          name="cargo-deny-${CARGO_DENY_VERSION}-${target}"
+          archive="${RUNNER_TEMP}/cargo-deny.tar.gz"
+          bin="${RUNNER_TEMP}/bin"
+          mkdir -p "${bin}"
+          curl -sSfL -o "${archive}" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${name}.tar.gz"
+          echo "${sha256}  ${archive}" | sha256sum --check --strict
+          tar -xzf "${archive}" -C "${bin}" --strip-components 1 "${name}/cargo-deny"
+          echo "${bin}" >> "${GITHUB_PATH}"
+
+      - name: Check advisories, licenses, bans, and sources
+        run: |
+          cargo deny --version
+          cargo deny --manifest-path platforms/linux/Cargo.toml --locked --all-features check
+
+      - name: Remove downloaded tools and build output
+        if: always()
+        run: rm -rf "${RUNNER_TEMP}/bin" "${RUNNER_TEMP}/cargo-deny.tar.gz" platforms/linux/target core/target
