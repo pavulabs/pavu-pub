@@ -5,9 +5,8 @@ on:
     branches: [main]
     paths:
       - ".github/**"
+  # Always report this required check, even when a PR does not change .github.
   pull_request:
-    paths:
-      - ".github/**"
   workflow_dispatch:
 
 permissions:
@@ -25,11 +24,8 @@ jobs:
   zizmor:
     name: Audit GitHub Actions workflows
     # A lightweight check, so it runs on the maintainer's self-hosted Linux
-    # host (pavu-light), not the build Mac. Bot-authored pull requests from
-    # this repository run on a GitHub-hosted runner instead.
-    if: >-
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
+    # host (pavu-light), not the build Mac. Bot and fork pull requests use
+    # GitHub-hosted runners so untrusted changes never use self-hosted runners.
     runs-on: >-
       ${{ (github.event_name != 'pull_request' ||
            (github.event.pull_request.head.repo.full_name == github.repository &&
