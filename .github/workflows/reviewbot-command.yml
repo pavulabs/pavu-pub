@@ -197,7 +197,7 @@ jobs:
       - name: Check ReviewBot configuration
         id: configuration
         env:
-          REVIEWBOT_API_KEY: ${{ secrets.ARK_API_KEY }}
+          REVIEWBOT_API_KEY: ${{ secrets.ARK_TOKEN }}
         run: |
           if [[ -n "${REVIEWBOT_API_KEY}" ]]; then
             echo "enabled=true" >> "${GITHUB_OUTPUT}"
@@ -207,7 +207,7 @@ jobs:
 
       - name: Report disabled ReviewBot
         if: steps.configuration.outputs.enabled != 'true'
-        run: echo "::notice::ReviewBot is disabled until the ARK_API_KEY repository secret is configured."
+        run: echo "::notice::ReviewBot is disabled until the organization ARK_TOKEN secret is available to this repository."
 
       - name: Check out trusted workflow revision for static diff
         if: steps.configuration.outputs.enabled == 'true'
@@ -267,7 +267,7 @@ jobs:
         if: steps.configuration.outputs.enabled == 'true'
         shell: bash
         env:
-          ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
+          ARK_API_KEY: ${{ secrets.ARK_TOKEN }}
           ARK_MODEL: ${{ vars.ARK_REVIEW_MODEL || 'kimi-k3' }}
           BASE_SHA: ${{ needs.prepare.outputs.base_sha }}
           HEAD_SHA: ${{ needs.prepare.outputs.head_sha }}
