@@ -1,0 +1,11 @@
+# macOS
+.DS_Store
+
+# Python test caches
+__pycache__/
+*.py[cod]
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
